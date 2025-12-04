@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
+#include <glob.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -619,6 +620,39 @@ static const char *ifs_value(void) {
 	return v ? v : " \t\n";
 }
 
+/* Step 3: glob a single field. Quoted metacharacters are backslash-escaped so
+ * glob(3) treats them literally; glob(3) honours backslash unless
+ * GLOB_NOESCAPE. No match -> the field is used as written (POSIX). */
+static void glob_field(const char *text, const char *flg, size_t n, Vec *out) {
+	int special = 0;
+	for (size_t i = 0; i < n; i++)
+		if (!flg[i] && (text[i] == '*' || text[i] == '?' || text[i] == '[')) special = 1;
+
+	Str lit = {0};
+	for (size_t i = 0; i < n; i++) sput(&lit, text[i]);
+
+	if (!special) {
+		vpush(out, lit.p ? lit.p : xstrdup(""));
+		return;
+	}
+	Str pat = {0};
+	for (size_t i = 0; i < n; i++) {
+		if (flg[i] && strchr("*?[]\\", text[i])) sput(&pat, '\\');
+		sput(&pat, text[i]);
+	}
+	glob_t g;
+	memset(&g, 0, sizeof g);
+	int rc = glob(pat.p ? pat.p : "", 0, NULL, &g);
+	if (rc == 0 && g.gl_pathc > 0) {
+		for (size_t i = 0; i < g.gl_pathc; i++) vpush(out, xstrdup(g.gl_pathv[i]));
+		free(lit.p);
+	} else {
+		vpush(out, lit.p ? lit.p : xstrdup(""));
+	}
+	globfree(&g);
+	free(pat.p);
+}
+
 enum { EX_FULL, EX_NOSPLIT };
 
 static void expand_word(const char *raw, Vec *out, int mode) {
@@ -655,11 +689,7 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 		if (i >= n) break;
 		size_t start = i;
 		while (i < n && !(!f[i] && strchr(ifs, t[i]))) i++;
-		{
-			Str lit = {0};
-			for (size_t k = start; k < i; k++) sput(&lit, t[k]);
-			vpush(out, lit.p ? lit.p : xstrdup(""));
-		}
+		glob_field(t + start, f + start, i - start, out);
 		any = 1;
 		if (i < n && !f[i] && !isspace((unsigned char)t[i])) {
 			i++; /* consume the hard delimiter; an empty field may follow */
