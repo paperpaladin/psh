@@ -474,14 +474,37 @@ static Node *parse_command(void) {
 }
 
 static Node *parse_pipeline(void) {
+	if (iskw("!")) { /* `! cmd` inverts the pipeline's status to exactly 0 or 1 */
+		adv();
+		Node *p = nnew(N_NOT);
+		if (!(p->body = parse_pipeline())) return NULL;
+		return p;
+	}
 	Node *n = parse_command();
 	if (!n) return NULL;
+	while (isop("|")) {
+		adv();
+		while (isop("\n")) adv();
+		Node *p = nnew(N_PIPE);
+		p->left = n;
+		if (!(p->right = parse_command())) return NULL;
+		n = p;
+	}
 	return n;
 }
 
 static Node *parse_and_or(void) {
 	Node *n = parse_pipeline();
 	if (!n) return NULL;
+	while (isop("&&") || isop("||")) {
+		int type = isop("&&") ? N_AND : N_OR;
+		adv();
+		while (isop("\n")) adv();
+		Node *p = nnew(type);
+		p->left = n;
+		if (!(p->right = parse_pipeline())) return NULL;
+		n = p;
+	}
 	return n;
 }
 
@@ -907,6 +930,69 @@ static int exec_simple(Node *n, int in_child) {
 	return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 
+/* Flatten the left-leaning N_PIPE tree into execution order. */
+static int flatten_pipe(Node *n, Node **out, int max) {
+	if (n->type != N_PIPE) {
+		if (max < 1) return -1;
+		out[0] = n;
+		return 1;
+	}
+	int k = flatten_pipe(n->left, out, max);
+	if (k < 0 || k >= max) return -1;
+	out[k] = n->right;
+	return k + 1;
+}
+
+static int exec_pipeline(Node *n) {
+	Node *cmds[32];
+	int nc = flatten_pipe(n, cmds, 32);
+	if (nc < 0) {
+		fprintf(stderr, "%s: pipeline too long\n", progname);
+		return 2;
+	}
+	pid_t pids[32];
+	int prev_read = -1;
+	fflush(NULL);
+	for (int i = 0; i < nc; i++) {
+		int fds[2] = {-1, -1};
+		if (i < nc - 1 && pipe(fds) < 0) fatal("pipe: %s", strerror(errno));
+		pid_t pid = fork();
+		if (pid < 0) fatal("fork: %s", strerror(errno));
+		if (pid == 0) {
+			signal(SIGINT, SIG_DFL);
+			if (prev_read >= 0) {
+				dup2(prev_read, 0);
+				close(prev_read);
+			}
+			if (fds[1] >= 0) {
+				close(fds[0]);
+				dup2(fds[1], 1);
+				close(fds[1]);
+			}
+			/* Every stage runs in its own process, so a builtin in a
+			 * pipeline cannot affect the parent shell -- the same surprise
+			 * dash gives you with `echo x | read v`. */
+			int st = (cmds[i]->type == N_SIMPLE) ? exec_simple(cmds[i], 1) : exec_node(cmds[i]);
+			fflush(NULL);
+			_exit(st);
+		}
+		pids[i] = pid;
+		if (prev_read >= 0) close(prev_read);
+		if (fds[1] >= 0) close(fds[1]);
+		prev_read = fds[0];
+	}
+	if (prev_read >= 0) close(prev_read);
+	int last = 0;
+	for (int i = 0; i < nc; i++) {
+		int st = 0;
+		while (waitpid(pids[i], &st, 0) < 0 && errno == EINTR) {}
+		/* A pipeline's status is the LAST command's status, not the first
+		 * failure: `false | true` is 0. */
+		if (i == nc - 1) last = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+	}
+	return last;
+}
+
 static int exec_compound_body(Node *n) {
 	switch (n->type) {
 	}
@@ -922,6 +1008,22 @@ static int exec_node(Node *n) {
 		(void)s;
 		return exec_node(n->right);
 	}
+	case N_AND: {
+		int s = exec_node(n->left);
+		status = s;
+		return s == 0 ? exec_node(n->right) : s;
+	}
+	case N_OR: {
+		int s = exec_node(n->left);
+		status = s;
+		return s != 0 ? exec_node(n->right) : s;
+	}
+	case N_NOT: {
+		int s = exec_node(n->body);
+		return status = (s == 0) ? 1 : 0;
+	}
+	case N_PIPE:
+		return status = exec_pipeline(n);
 	case N_SIMPLE:
 		return status = exec_simple(n, 0);
 	default: {
