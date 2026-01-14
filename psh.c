@@ -446,7 +446,33 @@ static int parse_redir(Node *n) {
 	return 1;
 }
 
+static int parse_trailing_redirs(Node *n) {
+	for (;;) {
+		int r = parse_redir(n);
+		if (r < 0) return -1;
+		if (!r) return 0;
+	}
+}
+
 static Node *parse_command(void) {
+	if (isop("(")) {
+		adv();
+		Node *n = nnew(N_SUBSHELL);
+		if (!(n->body = parse_list())) return NULL;
+		if (!isop(")")) return perr(cur()->text), NULL;
+		adv();
+		if (parse_trailing_redirs(n) < 0) return NULL;
+		return n;
+	}
+	if (iskw("{")) {
+		adv();
+		Node *n = nnew(N_GROUP);
+		if (!(n->body = parse_list())) return NULL;
+		if (!iskw("}")) return perr(cur()->text), NULL;
+		adv();
+		if (parse_trailing_redirs(n) < 0) return NULL;
+		return n;
+	}
 
 	Node *n = nnew(N_SIMPLE);
 	int got = 0;
@@ -995,6 +1021,24 @@ static int exec_pipeline(Node *n) {
 
 static int exec_compound_body(Node *n) {
 	switch (n->type) {
+	case N_SUBSHELL: {
+		fflush(NULL);
+		pid_t pid = fork();
+		if (pid < 0) fatal("fork: %s", strerror(errno));
+		if (pid == 0) {
+			signal(SIGINT, SIG_DFL);
+			int st = exec_node(n->body);
+			fflush(NULL);
+			_exit(st);
+		}
+		int st = 0;
+		while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+		return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+	}
+	case N_GROUP:
+		/* A brace group runs in the CURRENT shell -- unlike ( ), assignments
+		 * and cd inside it are visible afterwards. */
+		return exec_node(n->body);
 	}
 	return 2;
 }
