@@ -335,6 +335,27 @@ static int lex(const char *p) {
 				quoted = 1;
 				continue;
 			}
+			if (c == '`') {
+				fprintf(stderr, "%s: backquotes not supported, use $()\n", progname);
+				return -1;
+			}
+			if (c == '$' && p[1] == '(' && p[2] == '(') {
+				/* Fail loudly rather than silently evaluating $((1+1)) as a
+				 * subshell running the command `1+1`. */
+				fprintf(stderr, "%s: arithmetic expansion is not implemented\n", progname);
+				return -1;
+			}
+			if (c == '$' && p[1] == '(') {
+				sput(&w, '$');
+				p++;
+				p = copy_nested(p, &w, '(', ')');
+				if (!p) {
+					fprintf(stderr, "%s: unterminated $(\n", progname);
+					return -1;
+				}
+				quoted = 1;
+				continue;
+			}
 			if (c == '$' && p[1] == '{') {
 				sput(&w, '$');
 				p++;
@@ -613,6 +634,39 @@ static void eputs(Exp *e, const char *s, int quoted) {
 	while (*s) eput(e, *s++, quoted);
 }
 
+/* Run `cmd` in a child, capture its stdout, strip trailing newlines. */
+static char *command_subst(const char *cmd) {
+	int fds[2];
+	if (pipe(fds) < 0) fatal("pipe: %s", strerror(errno));
+	fflush(NULL);
+	pid_t pid = fork();
+	if (pid < 0) fatal("fork: %s", strerror(errno));
+	if (pid == 0) {
+		close(fds[0]);
+		if (fds[1] != 1) {
+			dup2(fds[1], 1);
+			close(fds[1]);
+		}
+		int s = exec_string(cmd);
+		fflush(NULL);
+		_exit(s);
+	}
+	close(fds[1]);
+	Str out = {0};
+	char buf[4096];
+	ssize_t r;
+	while ((r = read(fds[0], buf, sizeof buf)) > 0)
+		for (ssize_t i = 0; i < r; i++) sput(&out, buf[i]);
+	close(fds[0]);
+	int st = 0;
+	while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+	/* The substitution's status is visible to `x=$(false)`; a real command in
+	 * the same simple command overwrites it afterwards. */
+	status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+	while (out.n && out.p[out.n - 1] == '\n') out.p[--out.n] = 0;
+	return out.p ? out.p : xstrdup("");
+}
+
 /* Handle one ${...} body (without the braces). */
 static void expand_braced(const char *b, Exp *e, int dq) {
 	const char *v = getvar(b);
@@ -672,6 +726,22 @@ static void expand_into(const char *p, Exp *e, int dq_init) {
 			}
 			if (isdigit((unsigned char)n)) { /* $1.. unset -> empty, as in dash */
 				p += 2;
+				continue;
+			}
+			if (n == '(') {
+				Str raw = {0};
+				const char *q = copy_nested(p + 1, &raw, '(', ')');
+				if (!q) {
+					fprintf(stderr, "%s: unterminated $(\n", progname);
+					p += 2;
+					continue;
+				}
+				raw.p[raw.n - 1] = 0; /* drop trailing ')' */
+				char *out = command_subst(raw.p + 1);
+				eputs(e, out, dq);
+				free(raw.p);
+				free(out);
+				p = q;
 				continue;
 			}
 			if (n == '{') {
