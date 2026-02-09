@@ -669,15 +669,76 @@ static char *command_subst(const char *cmd) {
 
 /* Handle one ${...} body (without the braces). */
 static void expand_braced(const char *b, Exp *e, int dq) {
-	const char *v = getvar(b);
-	if (v) eputs(e, v, dq);
+	if (!strcmp(b, "#")) { /* ${#} is $#, not a length */
+		eputs(e, "0", dq);
+		return;
+	}
+	if (!strcmp(b, "?")) {
+		char num[16];
+		snprintf(num, sizeof num, "%d", status);
+		eputs(e, num, dq);
+		return;
+	}
+	if (*b == '#' && b[1]) { /* ${#NAME} -> length */
+		const char *v = getvar(b + 1);
+		char num[32];
+		snprintf(num, sizeof num, "%zu", v ? strlen(v) : (size_t)0);
+		eputs(e, num, dq);
+		return;
+	}
+	size_t nlen = 0;
+	while (b[nlen] && b[nlen] != ':' && b[nlen] != '-' && b[nlen] != '+') nlen++;
+	char *name = xmalloc(nlen + 1);
+	memcpy(name, b, nlen);
+	name[nlen] = 0;
+	const char *v = getvar(name);
+	const char *op = b + nlen;
+	int colon = *op == ':';
+	if (colon) op++;
+	int unset = !v || (colon && !*v);
+	if (*op == '-') {
+		if (unset) {
+			Exp sub = {0};
+			/* The default word is itself expanded, recursively. */
+			expand_into(op + 1, &sub, dq);
+			for (size_t i = 0; i < sub.text.n; i++) eput(e, sub.text.p[i], sub.flg.p[i]);
+		} else {
+			eputs(e, v, dq);
+		}
+	} else if (*op == '+') {
+		if (!unset) {
+			Exp sub = {0};
+			expand_into(op + 1, &sub, dq);
+			for (size_t i = 0; i < sub.text.n; i++) eput(e, sub.text.p[i], sub.flg.p[i]);
+		}
+	} else if (!*op) {
+		if (v) eputs(e, v, dq);
+	} else {
+		fprintf(stderr, "%s: ${%s}: unsupported expansion\n", progname, b);
+	}
+	free(name);
 }
 
 /* Step 1: substitution pass. Fills e->text and the per-byte quoted flags. */
 static void expand_into(const char *p, Exp *e, int dq_init) {
 	int dq = dq_init;
+	const char *begin = p;
 	while (*p) {
 		char c = *p;
+		/* Tilde expansion is step 1a: only an unquoted leading ~ followed by
+		 * '/' or end-of-word, and the result is NOT field-split or globbed,
+		 * hence the quoted flag. shortcut: no ~user and no expansion after
+		 * ':' in assignments. Ceiling: PATH=~/bin:~/sbin keeps the second
+		 * tilde literal. Upgrade path: getpwnam(3) plus a colon-aware scan of
+		 * assignment right-hand sides. */
+		if (c == '~' && p == begin && !dq && (p[1] == '/' || p[1] == 0)) {
+			const char *h = getvar("HOME");
+			if (h) {
+				while (*h) eput(e, *h++, 1);
+				p++;
+				continue;
+			}
+		}
 		if (!dq && c == '\'') {
 			exp_sawquote = 1;
 			p++;
