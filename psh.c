@@ -990,6 +990,46 @@ static int b_echo(char **av) {
 	return 0;
 }
 
+static int b_cd(char **av) {
+	const char *d = av[1];
+	int print = 0;
+	char *target = NULL;
+	if (!d) {
+		d = getvar("HOME");
+		if (!d) {
+			fprintf(stderr, "%s: cd: HOME not set\n", progname);
+			return 2;
+		}
+	} else if (!strcmp(d, "-")) {
+		const char *o = getvar("OLDPWD");
+		if (!o) {
+			fflush(stdout);
+			fprintf(stderr, "%s: cd: OLDPWD not set\n", progname);
+			return 2;
+		}
+		target = xstrdup(o);
+		d = target;
+		print = 1; /* `cd -` echoes the directory it moved to */
+	}
+	char old[PATH_MAX];
+	int haveold = getcwd(old, sizeof old) != NULL;
+	if (chdir(d) < 0) {
+		fflush(stdout);
+		fprintf(stderr, "%s: cd: %s: %s\n", progname, d, strerror(errno));
+		free(target);
+		return 2; /* dash reports 2 here, not 1 */
+	}
+	if (haveold) setvar("OLDPWD", old);
+	char buf[PATH_MAX];
+	if (getcwd(buf, sizeof buf)) setvar("PWD", buf);
+	if (print) {
+		printf("%s\n", getvar("PWD") ? getvar("PWD") : d);
+		fflush(stdout);
+	}
+	free(target);
+	return 0;
+}
+
 static int b_pwd(char **av) {
 	(void)av;
 	char buf[PATH_MAX];
@@ -999,6 +1039,107 @@ static int b_pwd(char **av) {
 	}
 	printf("%s\n", buf);
 	fflush(stdout);
+	return 0;
+}
+
+static int b_export(char **av) {
+	if (!av[1]) return 0;
+	for (int i = 1; av[i]; i++) {
+		char *eq = strchr(av[i], '=');
+		if (eq) {
+			*eq = 0;
+			if (!valid_name(av[i], strlen(av[i]))) {
+				fprintf(stderr, "%s: export: %s: bad name\n", progname, av[i]);
+				*eq = '=';
+				return 1;
+			}
+			setvar(av[i], eq + 1);
+			exportvar(av[i]);
+			*eq = '=';
+		} else {
+			if (!valid_name(av[i], strlen(av[i]))) {
+				fprintf(stderr, "%s: export: %s: bad name\n", progname, av[i]);
+				return 1;
+			}
+			exportvar(av[i]);
+		}
+	}
+	return 0;
+}
+
+static int b_exit(char **av) {
+	int s = av[1] ? atoi(av[1]) & 0xff : status;
+	fflush(NULL);
+	exit(s);
+}
+
+static int b_read(char **av) {
+	int nv = 0;
+	while (av[nv + 1]) nv++;
+	if (nv == 0) {
+		fprintf(stderr, "%s: read: arg expected\n", progname);
+		return 2;
+	}
+	/* Byte-at-a-time: `read` must not consume past the newline, or the next
+	 * command in a pipeline loses its input. */
+	Str line = {0};
+	int got = 0, eof = 0;
+	for (;;) {
+		char c;
+		ssize_t r = read(0, &c, 1);
+		if (r <= 0) {
+			eof = 1;
+			break;
+		}
+		got = 1;
+		if (c == '\\') {
+			char d;
+			if (read(0, &d, 1) <= 0) break;
+			if (d == '\n') continue; /* line continuation */
+			sput(&line, d);
+			continue;
+		}
+		if (c == '\n') break;
+		sput(&line, c);
+	}
+	const char *t = line.p ? line.p : "";
+	size_t n = line.n;
+	const char *ifs = ifs_value();
+	size_t i = 0;
+	for (int k = 0; k < nv; k++) {
+		while (i < n && strchr(ifs, t[i]) && isspace((unsigned char)t[i])) i++;
+		size_t start = i;
+		size_t end;
+		if (k == nv - 1) {
+			end = n;
+			while (end > start && strchr(ifs, t[end - 1]) && isspace((unsigned char)t[end - 1]))
+				end--;
+			i = n;
+		} else {
+			while (i < n && !strchr(ifs, t[i])) i++;
+			end = i;
+			if (i < n && !isspace((unsigned char)t[i])) i++;
+		}
+		char *val = xmalloc(end - start + 1);
+		memcpy(val, t + start, end - start);
+		val[end - start] = 0;
+		setvar(av[k + 1], val);
+		free(val);
+	}
+	free(line.p);
+	return (eof && !got) ? 1 : 0;
+}
+
+static int b_unset(char **av) {
+	/* dash does not complain about unsetting something that was never set. */
+	for (int i = 1; av[i]; i++) {
+		if (!valid_name(av[i], strlen(av[i]))) {
+			fflush(stdout);
+			fprintf(stderr, "%s: unset: %s: bad name\n", progname, av[i]);
+			return 1;
+		}
+		unsetvar(av[i]);
+	}
 	return 0;
 }
 
@@ -1021,6 +1162,8 @@ static struct {
 } builtins[] = {
     {"echo", b_echo}, {"true", b_true}, {"false", b_false},
     {"pwd", b_pwd},   {":", b_colon},
+    {"cd", b_cd},     {"exit", b_exit}, {"export", b_export},
+    {"read", b_read}, {"unset", b_unset},
 };
 
 static int builtin_index(const char *name) {
