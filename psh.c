@@ -489,6 +489,26 @@ static int parse_trailing_redirs(Node *n) {
 	}
 }
 
+static Node *parse_if_body(void) { /* 'if' or 'elif' already consumed */
+	Node *n = nnew(N_IF);
+	if (!(n->cond = parse_list())) return NULL;
+	if (!iskw("then")) return perr(cur()->text), NULL;
+	adv();
+	if (!(n->body = parse_list())) return NULL;
+	if (iskw("elif")) {
+		adv();
+		if (!(n->els = parse_if_body())) return NULL;
+		return n; /* the innermost elif consumed the single 'fi' */
+	}
+	if (iskw("else")) {
+		adv();
+		if (!(n->els = parse_list())) return NULL;
+	}
+	if (!iskw("fi")) return perr(cur()->text), NULL;
+	adv();
+	return n;
+}
+
 static Node *parse_command(void) {
 	if (isop("(")) {
 		adv();
@@ -506,6 +526,12 @@ static Node *parse_command(void) {
 		if (!iskw("}")) return perr(cur()->text), NULL;
 		adv();
 		if (parse_trailing_redirs(n) < 0) return NULL;
+		return n;
+	}
+	if (iskw("if")) {
+		adv();
+		Node *n = parse_if_body();
+		if (n && parse_trailing_redirs(n) < 0) return NULL;
 		return n;
 	}
 
@@ -1446,6 +1472,13 @@ static int exec_compound_body(Node *n) {
 		/* A brace group runs in the CURRENT shell -- unlike ( ), assignments
 		 * and cd inside it are visible afterwards. */
 		return exec_node(n->body);
+	case N_IF: {
+		int c = exec_node(n->cond);
+		status = c;
+		if (c == 0) return exec_node(n->body);
+		if (n->els) return exec_node(n->els);
+		return 0; /* an if with no taken branch is successful */
+	}
 	}
 	return 2;
 }
