@@ -33,6 +33,13 @@
 static const char *progname = "psh";
 static int status = 0; /* $? */
 
+/* `break`/`continue` unwind by setting these instead of longjmp: every
+ * construct that can contain a loop body checks loopctl after running a child
+ * node and stops early. loopcnt is the remaining level count for `break 2`. */
+static int loopctl; /* 0 none, 1 break, 2 continue */
+static int loopcnt;
+static int loopdepth; /* enclosing loops in THIS shell process */
+
 static void fatal(const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
@@ -532,6 +539,20 @@ static Node *parse_command(void) {
 		adv();
 		Node *n = parse_if_body();
 		if (n && parse_trailing_redirs(n) < 0) return NULL;
+		return n;
+	}
+	if (iskw("while") || iskw("until")) {
+		int until = iskw("until");
+		adv();
+		Node *n = nnew(N_WHILE);
+		n->var = until ? xstrdup("until") : NULL; /* reuse: flags inversion */
+		if (!(n->cond = parse_list())) return NULL;
+		if (!iskw("do")) return perr(cur()->text), NULL;
+		adv();
+		if (!(n->body = parse_list())) return NULL;
+		if (!iskw("done")) return perr(cur()->text), NULL;
+		adv();
+		if (parse_trailing_redirs(n) < 0) return NULL;
 		return n;
 	}
 
@@ -1169,6 +1190,22 @@ static int b_unset(char **av) {
 	return 0;
 }
 
+static int b_loopctl(char **av, int which) {
+	int n = av[1] ? atoi(av[1]) : 1;
+	if (n < 1) {
+		fprintf(stderr, "%s: %s: bad count\n", progname, av[0]);
+		return 2;
+	}
+	/* dash silently ignores break outside a loop; match that. */
+	if (loopdepth == 0) return 0;
+	loopctl = which;
+	loopcnt = n > loopdepth ? loopdepth : n;
+	return 0;
+}
+
+static int b_break(char **av) { return b_loopctl(av, 1); }
+static int b_continue(char **av) { return b_loopctl(av, 2); }
+
 static int b_true(char **av) {
 	(void)av;
 	return 0;
@@ -1190,6 +1227,7 @@ static struct {
     {"pwd", b_pwd},   {":", b_colon},
     {"cd", b_cd},     {"exit", b_exit}, {"export", b_export},
     {"read", b_read}, {"unset", b_unset},
+    {"break", b_break}, {"continue", b_continue},
 };
 
 static int builtin_index(const char *name) {
@@ -1452,6 +1490,17 @@ static int exec_pipeline(Node *n) {
 	return last;
 }
 
+/* One loop level consumes one pending break/continue. Returns 1 if this loop
+ * should keep iterating (a `continue` aimed at us), 0 if it must stop (a
+ * `break` aimed at us, or anything aimed at an outer loop). */
+static int loop_absorb(void) {
+	if (--loopcnt > 0) return 0; /* still unwinding towards an outer loop */
+	int which = loopctl;
+	loopctl = 0;
+	loopcnt = 0;
+	return which == 2;
+}
+
 static int exec_compound_body(Node *n) {
 	switch (n->type) {
 	case N_SUBSHELL: {
@@ -1479,6 +1528,21 @@ static int exec_compound_body(Node *n) {
 		if (n->els) return exec_node(n->els);
 		return 0; /* an if with no taken branch is successful */
 	}
+	case N_WHILE: {
+		int invert = n->var != NULL; /* `until` */
+		int st = 0;
+		loopdepth++;
+		for (;;) {
+			int c = exec_node(n->cond);
+			status = c;
+			if (loopctl) break;
+			if (invert ? (c == 0) : (c != 0)) break;
+			st = exec_node(n->body);
+			if (loopctl && !loop_absorb()) break;
+		}
+		loopdepth--;
+		return st; /* zero iterations -> 0, as POSIX requires */
+	}
 	}
 	return 2;
 }
@@ -1489,17 +1553,19 @@ static int exec_node(Node *n) {
 	case N_SEQ: {
 		if (!n->left && !n->right) return status; /* empty program */
 		int s = exec_node(n->left);
-		(void)s;
+		if (loopctl) return s; /* break/continue aborts the rest of the list */
 		return exec_node(n->right);
 	}
 	case N_AND: {
 		int s = exec_node(n->left);
 		status = s;
+		if (loopctl) return s;
 		return s == 0 ? exec_node(n->right) : s;
 	}
 	case N_OR: {
 		int s = exec_node(n->left);
 		status = s;
+		if (loopctl) return s;
 		return s != 0 ? exec_node(n->right) : s;
 	}
 	case N_NOT: {
@@ -1535,6 +1601,9 @@ static int exec_string(const char *s) {
 	toks = NULL;
 	ntoks = tcap = ti = 0;
 
+	int oloopctl = loopctl, oloopcnt = loopcnt, oloopdepth = loopdepth;
+	loopctl = loopcnt = loopdepth = 0;
+
 	int rc;
 	if (lex(s) < 0) {
 		rc = 2;
@@ -1547,6 +1616,9 @@ static int exec_string(const char *s) {
 	ntoks = ont;
 	tcap = oc;
 	ti = oi;
+	loopctl = oloopctl;
+	loopcnt = oloopcnt;
+	loopdepth = oloopdepth;
 	return rc;
 }
 
