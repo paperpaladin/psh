@@ -555,6 +555,29 @@ static Node *parse_command(void) {
 		if (parse_trailing_redirs(n) < 0) return NULL;
 		return n;
 	}
+	if (iskw("for")) {
+		adv();
+		if (cur()->type != TWORD || !valid_name(cur()->text, strlen(cur()->text)))
+			return perr(cur()->text), NULL;
+		Node *n = nnew(N_FOR);
+		n->var = xstrdup(cur()->text);
+		adv();
+		while (isop("\n")) adv();
+		if (!iskw("in")) return perr(cur()->text), NULL;
+		adv();
+		while (cur()->type == TWORD && !iskw("do")) {
+			vpush(&n->words, xstrdup(cur()->text));
+			adv();
+		}
+		while (isop(";") || isop("\n")) adv();
+		if (!iskw("do")) return perr(cur()->text), NULL;
+		adv();
+		if (!(n->body = parse_list())) return NULL;
+		if (!iskw("done")) return perr(cur()->text), NULL;
+		adv();
+		if (parse_trailing_redirs(n) < 0) return NULL;
+		return n;
+	}
 
 	Node *n = nnew(N_SIMPLE);
 	int got = 0;
@@ -1542,6 +1565,19 @@ static int exec_compound_body(Node *n) {
 		}
 		loopdepth--;
 		return st; /* zero iterations -> 0, as POSIX requires */
+	}
+	case N_FOR: {
+		Vec items = {0};
+		for (int i = 0; i < n->words.n; i++) expand_word(n->words.v[i], &items, EX_FULL);
+		int st = 0;
+		loopdepth++;
+		for (int i = 0; i < items.n; i++) {
+			setvar(n->var, items.v[i]);
+			st = exec_node(n->body);
+			if (loopctl && !loop_absorb()) break;
+		}
+		loopdepth--;
+		return st;
 	}
 	}
 	return 2;
