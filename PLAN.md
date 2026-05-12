@@ -8,7 +8,8 @@ command it ran.
 
 In scope: simple commands with arguments; single-quote, double-quote and
 backslash quoting; pipelines (`|`); redirections (`<`, `>`, `>>`, `N>`, `N>&M`);
-`&&`, `||`, `;`, `!`; subshells `( )` and brace groups `{ }`; variable
+`&&`, `||`, `;`, `!`; here-documents (`<<`, `<<-`, and the quoted-delimiter
+forms); subshells `( )` and brace groups `{ }`; variable
 assignment, `$VAR`, `${VAR}`, `${VAR:-w}`, `${VAR:+w}`, `${#VAR}`, `$?`;
 pathname expansion through `glob(3)`; command substitution `$(...)`; the
 builtins `cd`, `exit`, `export`, `echo`, `true`, `false`, `pwd`, `read`, `:`,
@@ -61,7 +62,7 @@ Ranked, strongest first:
 - Job control: no `&`, no `jobs`/`fg`/`bg`, no process groups, no terminal
   ownership handoff. `&` is a syntax error.
 - Shell functions (`name() { ... }`).
-- Here-documents (`<<`, `<<-`) and here-strings.
+- Here-strings (`<<<`). psh refuses them loudly; dash has none either.
 - `trap`, `set -e`/`set -u`/`set -x`/`set --`, `shift`, positional parameters
   and `$@`/`$*`/`$1` (they expand to empty, which is what dash does when a
   script is given no arguments).
@@ -139,11 +140,19 @@ Ranked, strongest first:
 
 ### Milestone 1
 
-- [ ] Here-documents: `<<WORD`, `<<-WORD`, and the quoted-delimiter form that
+- [x] Here-documents: `<<WORD`, `<<-WORD`, and the quoted-delimiter form that
       suppresses expansion of the body.
       why: the single most-used feature psh lacks; every real script that emits
       a config file needs it, and it is the only redirection whose operand is
       lexed out of the *following* lines rather than the current token stream.
+      done: handled in the lexer, which already receives the whole script, so
+      fetching the body is a forward scan from the newline rather than a second
+      input channel. 21 corpus cases, 164 -> 185. The body needed a third `dq`
+      state in expansion, because it is not a double-quoted word: a quote in
+      the body is ordinary and a backslash before one keeps the backslash.
+      Two divergences from dash are in the README rather than fixed: a stray
+      `)` in a body inside `$(...)`, and backquotes, which are refused rather
+      than silently passed through as literals.
 - [ ] Shell functions, including `return` and the fact that a function body is
       a compound command that can carry redirections.
       why: without functions a script cannot factor anything, so the corpus
