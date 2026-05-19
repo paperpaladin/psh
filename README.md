@@ -9,7 +9,7 @@ A POSIX shell subset in one C file, kept honest by differential testing against
 $ make test
 gcc -std=c11 -Wall -Wextra -O2 -o psh psh.c
 ./t/run.sh
-185 agree, 0 disagree, 0 skipped
+207 agree, 0 disagree, 0 skipped
 ```
 
 ```
@@ -17,7 +17,7 @@ $ make test-asan
 gcc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
 	-fno-omit-frame-pointer -o psh-asan psh.c
 ASAN_OPTIONS=detect_leaks=0 PSH=./psh-asan ./t/run.sh
-185 agree, 0 disagree, 0 skipped
+207 agree, 0 disagree, 0 skipped
 ```
 
 Run a script or a string:
@@ -44,7 +44,7 @@ So psh is organised around that question. There is no spec-reading step and no
 `t/cases/` compares psh's output against dash's, and every corner that psh
 skips is skipped on purpose, named below, and not quietly papered over.
 
-The interesting artefact is therefore not the shell. It is the 185-script
+The interesting artefact is therefore not the shell. It is the 207-script
 corpus and the fact that the number on the last line of `make test` is a real
 measurement rather than a self-assessment.
 
@@ -124,6 +124,16 @@ leading `~` or `~/`. `if`/`elif`/`else`/`fi`, `while`, `until`, `for ... in`,
 `break [n]`, `continue [n]`. Builtins `cd` (including `cd -`), `exit`, `export`,
 `echo`, `true`, `false`, `pwd`, `read`, `unset`, `:`.
 
+Shell functions: `name() compound-command`, with the body able to carry its own
+redirections -- `f() { echo x; } > file` redirects on every call, not once at
+definition. `return [n]`, where a bare `return` keeps the current status and a
+`return` outside a function ends the script, as it does in dash. Functions beat
+regular builtins and lose to special ones, which is POSIX 2.9.1's search order:
+a function named `true` shadows the builtin, and one named `export` is refused
+at parse time the way dash refuses it. `unset -f` removes one. Variables are
+shared, not scoped, because POSIX functions have no locals. Recursion is capped
+at 1000 frames, which is dash's number and dash's exit status.
+
 Here-documents: `<<WORD`, `<<-WORD` with leading tabs stripped from both the
 body and the delimiter line, and the quoted forms `<<'W'`, `<<"W"` and `<<\W`
 that suppress expansion of the body entirely. An unquoted delimiter means the
@@ -141,7 +151,6 @@ Honest list. None of these are "coming soon"; they are absent today.
 - **No job control.** `&` is a syntax error. No `jobs`, `fg`, `bg`, `wait`, no
   process groups, no terminal ownership. The shell ignores `SIGINT` outright, so
   Ctrl-C will not interrupt a loop -- it only reaches the foreground child.
-- **No functions.** `f() { ...; }` does not parse.
 - **No here-strings.** `<<<` is refused with a diagnostic rather than lexed as
   `<<` with an empty delimiter, which would silently swallow the rest of the
   file. dash has no `<<<` either.
@@ -161,10 +170,20 @@ Honest list. None of these are "coming soon"; they are absent today.
   left alone.
 - **No `trap`.**
 - **No `set`.** No `set -e`, `-u`, `-x`, and no `set --`.
-- **No positional parameters.** `$1`..`$9` expand to empty and `$#` expands to
-  `0`, which is what dash does for a script invoked without arguments -- so the
-  corpus agrees, but psh would diverge the moment arguments were passed. There
-  is no `$@`, no `$*`, no `shift`.
+- **No positional parameters, which makes functions much less useful than they
+  look.** `$1`..`$9` expand to empty and `$#` expands to `0`. That is what dash
+  does for a script invoked without arguments, so the corpus agrees -- and it
+  means a function cannot take an argument. `f() { echo "$1"; }; f hi` prints a
+  blank line here and `hi` in dash. This is the next item in `PLAN.md` for
+  exactly that reason: functions came first because the plan said so, and the
+  pairing is what makes either worth having.
+- **No local variables.** POSIX has none and dash's `local` is an extension, so
+  a function that sets a variable changes the caller's. Asserted rather than
+  merely absent: `191-function-globals.sh` compares that against dash.
+- **`break` inside a function can reach the caller's loops.** `loopdepth` is
+  per-process and is not saved across a call, so `f() { break; }` called from
+  inside a loop breaks that loop. dash has the same wart, so the corpus cannot
+  catch it, which means it is untested rather than verified.
 - **No arithmetic expansion.** `$(( ))` is refused with a diagnostic and exit
   status 2, rather than being silently mis-evaluated as a subshell running a
   command called `1+1`. Counting loops in the corpus call `expr`.
@@ -187,7 +206,7 @@ Honest list. None of these are "coming soon"; they are absent today.
 
 ## Design
 
-One file, ~1900 lines, six stages that each hand a single data structure to the
+One file, ~2200 lines, six stages that each hand a single data structure to the
 next:
 
 ```
