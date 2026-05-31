@@ -9,7 +9,7 @@ A POSIX shell subset in one C file, kept honest by differential testing against
 $ make test
 gcc -std=c11 -Wall -Wextra -O2 -o psh psh.c
 ./t/run.sh
-207 agree, 0 disagree, 0 skipped
+212 agree, 0 disagree, 0 skipped
 ```
 
 ```
@@ -17,7 +17,7 @@ $ make test-asan
 gcc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
 	-fno-omit-frame-pointer -o psh-asan psh.c
 ASAN_OPTIONS=detect_leaks=0 PSH=./psh-asan ./t/run.sh
-207 agree, 0 disagree, 0 skipped
+212 agree, 0 disagree, 0 skipped
 ```
 
 Run a script or a string:
@@ -44,9 +44,12 @@ So psh is organised around that question. There is no spec-reading step and no
 `t/cases/` compares psh's output against dash's, and every corner that psh
 skips is skipped on purpose, named below, and not quietly papered over.
 
-The interesting artefact is therefore not the shell. It is the 207-script
-corpus and the fact that the number on the last line of `make test` is a real
-measurement rather than a self-assessment.
+The interesting artefact is therefore not the shell. It is the 208-script
+corpus -- plus four checks that psh refuses the expansions it has not
+implemented -- and the fact that the number on the last line of `make test`
+is a real measurement rather than a self-assessment. The corpus size is
+pinned, because a run over an empty corpus and a run over all of it both used
+to print `0 disagree` and exit 0.
 
 ## The oracle
 
@@ -132,7 +135,11 @@ regular builtins and lose to special ones, which is POSIX 2.9.1's search order:
 a function named `true` shadows the builtin, and one named `export` is refused
 at parse time the way dash refuses it. `unset -f` removes one. Variables are
 shared, not scoped, because POSIX functions have no locals. Recursion is capped
-at 1000 frames, which is dash's number and dash's exit status.
+at 1000 frames, which is dash's number and dash's exit status. The number is
+checked and not just asserted: `208-function-recursion-500-deep.sh` recurses
+500 deep and must complete, so a cap below 500 fails the suite. The
+infinite-recursion case alone could not tell -- it trips any cap, and
+`MAXFUNCDEPTH=50` passed all 207 of the old corpus.
 
 Here-documents: `<<WORD`, `<<-WORD` with leading tabs stripped from both the
 body and the delimiter line, and the quoted forms `<<'W'`, `<<"W"` and `<<\W`
@@ -170,6 +177,14 @@ Honest list. None of these are "coming soon"; they are absent today.
   left alone.
 - **No `trap`.**
 - **No `set`.** No `set -e`, `-u`, `-x`, and no `set --`.
+- **`${VAR#pat}` and `${VAR%pat}` are refused, not silently empty.** They are
+  not implemented (PLAN item 201), and until recently the name scan in
+  `expand_brace` stopped only at `:`, `-` and `+` -- so `${n#x}` was read as a
+  variable *named* `n#x`, found unset, and expanded to nothing while dash
+  gives `xx`. No diagnostic at all. psh already failed loudly on `$((...))`
+  for exactly this reason. Four checks in the harness now assert the refusal,
+  since an unimplemented expansion can never agree with dash and so cannot
+  live in the corpus.
 - **No positional parameters, which makes functions much less useful than they
   look.** `$1`..`$9` expand to empty and `$#` expands to `0`. That is what dash
   does for a script invoked without arguments, so the corpus agrees -- and it
