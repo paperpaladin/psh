@@ -8,19 +8,19 @@ command it ran.
 
 In scope: simple commands with arguments; single-quote, double-quote and
 backslash quoting; pipelines (`|`); redirections (`<`, `>`, `>>`, `N>`, `N>&M`);
-`&&`, `||`, `;`, `!`; here-documents (`<<`, `<<-`, and the quoted-delimiter
+`&&`, `||`, `;`, `!`. Here-documents (`<<`, `<<-`, and the quoted-delimiter
 forms); subshells `( )` and brace groups `{ }`; variable
 assignment, `$VAR`, `${VAR}`, `${VAR:-w}`, `${VAR:+w}`, `${#VAR}`, `$?`;
 pathname expansion through `glob(3)`; command substitution `$(...)`; the
 builtins `cd`, `exit`, `export`, `echo`, `true`, `false`, `pwd`, `read`, `:`,
-`break`, `continue`, `unset`; and the compound commands `if/elif/else/fi`,
+`break`, `continue`, `unset`, and the compound commands `if/elif/else/fi`,
 `while/do/done`, `until/do/done`, `for/in/do/done`.
 
-Out of scope, and deliberately so: everything in **Non-goals** below.
+Out of scope, and deliberately so: everything in Non-goals below.
 
 ## Hard invariant
 
-For every script in `t/cases/`, psh's **stdout** and **exit status** are
+For every script in `t/cases/`, psh's stdout and **exit status** are
 byte-for-byte identical to dash's. `make test` is the enforcement: it reports
 "N agree, M disagree, K skipped" and exits nonzero if M is not zero.
 
@@ -35,7 +35,7 @@ each one is a bug people ship:
   -> pathname expansion -> quote removal, and splitting and globbing apply only
   to bytes that came out of substitution *unquoted*. psh tracks a quoted flag
   per output byte to make this representable at all.
-- A pipeline's status is its **last** command's status, not its first failure.
+- A pipeline's status is its last command's status, not its first failure.
 - A command with no command word (`x=1`, `> f`) succeeds, unless a command
   substitution in its assignments left a status behind.
 
@@ -43,16 +43,16 @@ each one is a bug people ship:
 
 Ranked, strongest first:
 
-1. **dash** (`/bin/dash`), run on the same script in the same scratch directory
+1. dash (`/bin/dash`), run on the same script in the same scratch directory
    path, compared on stdout and exit status. This is the authority. If dash and
    psh disagree, psh is wrong by definition. If dash *rejects* a script
-   (syntax error, exit 2), the case is **skipped** rather than scored: an oracle
+   (syntax error, exit 2), the case is skipped, not scored: an oracle
    that will not run the program cannot rule on it.
-2. **ASAN + UBSAN** over the whole corpus (`make test-asan`). Memory errors in
+2. ASAN + UBSAN over the whole corpus (`make test-asan`). Memory errors in
    the expansion buffers and the parallel quote-flag arrays are exactly the
    class of bug that produces *intermittently* correct output, which the
    differential test alone would miss.
-3. **gcc `-Wall -Wextra`** at zero warnings. Cheapest signal available.
+3. gcc `-Wall -Wextra` at zero warnings. Cheapest signal available.
 4. Hand probing against dash while developing, promoted into `t/cases/` the
    moment it finds a divergence. Six of the first-draft bugs were found this
    way and every one of them is now a numbered case.
@@ -62,14 +62,14 @@ Ranked, strongest first:
 - Job control: no `&`, no `jobs`/`fg`/`bg`, no process groups, no terminal
   ownership handoff. `&` is a syntax error.
 - Shell functions (`name() { ... }`).
-- Here-strings (`<<<`). psh refuses them loudly; dash has none either.
+- Here-strings (`<<<`). psh refuses them loudly. Dash has none either.
 - `trap`, `set -e`/`set -u`/`set -x`/`set --`, `shift`, positional parameters
   and `$@`/`$*`/`$1` (they expand to empty, which is what dash does when a
   script is given no arguments).
-- Arithmetic expansion `$(( ))`. psh refuses it loudly rather than silently
+- Arithmetic expansion `$(( ))`. psh refuses it loudly instead of silently
   mis-evaluating it.
 - `case`/`esac`.
-- Backquote command substitution. `$()` only; a backquote is a hard error.
+- Backquote command substitution. `$()` only. A backquote is a hard error.
 - `${VAR%pat}`, `${VAR#pat}`, `${VAR:=w}`, `${VAR:?w}`.
 - Aliases, `eval`, `exec`, `getopts`, `hash`, `times`, `ulimit`, `umask`, `readonly`.
 - Interactive editing, history, prompts, `$PS1`.
@@ -100,14 +100,14 @@ Ranked, strongest first:
       why: control flow is where exit-status propagation goes wrong, and exit
       status is half of what the oracle compares.
 - [x] Subshells `( )` and brace groups `{ }`.
-      why: they differ in exactly one observable way -- whether assignments
-      survive -- so having only one of them is not a subset, it is a wrong answer.
+      why: they differ in exactly one observable way, whether assignments
+      survive, so having only one of them gives a wrong answer.
 - [x] Command substitution `$(...)`; hard errors for backquotes and `$(( ))`.
       why: `$((1+1))` silently parsed as a subshell running a command named
       `1+1` and printed nothing. A loud refusal costs a diagnostic; a silent
       wrong answer costs an afternoon.
 - [x] `${V:-w}`, `${V:+w}`, `${#V}`, `${?}`, `${#}`, leading-tilde expansion.
-      why: `echo ~` printing a literal tilde was the dangerous shape of bug --
+      why: `echo ~` printing a literal tilde was the dangerous shape of bug,
       plausible output, no diagnostic, wrong answer.
 - [x] Builtins `echo`, `true`, `false`, `pwd`, `:`.
       why: dash's `echo` interprets backslash escapes with no `-e` and consumes
@@ -121,7 +121,7 @@ Ranked, strongest first:
       shared `fi` is the detail every first attempt gets wrong.
 - [x] `while`/`until`, `break [n]`, `continue [n]`.
       why: without `break`, a missing keyword inside `while true` is an infinite
-      loop rather than an error message.
+      loop, not an error message.
 - [x] `for ... in`.
       why: its item list exercises substitution, splitting and globbing together,
       so it is the construct where every earlier decision becomes visible at once.
@@ -135,7 +135,7 @@ Ranked, strongest first:
       why: most of these were written in response to a disagreement, so each is a
       regression test for a bug that actually shipped.
 - [x] README and PLAN.
-      why: documenting exactly which corner was skipped is the valuable part; a
+      why: documenting exactly which corner was skipped is the part that matters; a
       list of omissions is worth more than an unmeasured claim of completeness.
 
 ### Milestone 1
@@ -144,13 +144,13 @@ Ranked, strongest first:
       suppresses expansion of the body.
       why: the single most-used feature psh lacks; every real script that emits
       a config file needs it, and it is the only redirection whose operand is
-      lexed out of the *following* lines rather than the current token stream.
+      lexed out of the *following* lines, not the current token stream.
       done: handled in the lexer, which already receives the whole script, so
-      fetching the body is a forward scan from the newline rather than a second
+      fetching the body is a forward scan from the newline, not a second
       input channel. 21 corpus cases, 164 -> 185. The body needed a third `dq`
       state in expansion, because it is not a double-quoted word: a quote in
       the body is ordinary and a backslash before one keeps the backslash.
-      Two divergences from dash are in the README rather than fixed: a stray
+      Two divergences from dash are in the README, not fixed: a stray
       `)` in a body inside `$(...)`, and backquotes, which are refused rather
       than silently passed through as literals.
 - [x] Shell functions, including `return` and the fact that a function body is
@@ -158,15 +158,15 @@ Ranked, strongest first:
       why: without functions a script cannot factor anything, so the corpus
       cannot grow past straight-line tests.
       done: 22 cases, 185 -> 207. The body being a compound command meant the
-      redirection worked for free -- parse_command already attaches trailing
+      redirection worked for free, parse_command already attaches trailing
       redirections to the compound, so `f() { ...; } > file` redirects per call
       with no extra code at all. Two guesses were wrong and dash corrected
-      both: a top-level `return` ends the script rather than being a quiet
-      no-op, and the recursion cap has to be dash's 1000 rather than a number
+      both: a top-level `return` ends the script instead of being a quiet
+      no-op, and the recursion cap has to be dash's 1000, not a number
       of my own, because a script recursing 500 deep works there and failed
       here at the 100 I first picked. Six mutations, five caught; the survivor
       was the retctl break in the while loop, observable only when the loop
-      condition has a side effect, which no case had -- case 207 is that case
+      condition has a side effect, which no case had, case 207 is that case
       and it kills it.
 - [ ] Positional parameters: `$1`..`$9`, `$#`, `"$@"` versus `$*`, `shift`,
       `set --`.
@@ -193,7 +193,7 @@ Ranked, strongest first:
       piece of remaining work.
 - [ ] `case`/`esac` with `fnmatch(3)` patterns and `|` alternatives.
       why: the only pattern-matching control structure, and it shares the glob
-      engine already present, so the cost is parsing rather than semantics.
+      engine already present, so the cost is parsing, not semantics.
 - [ ] Arithmetic expansion `$(( ))` with the full POSIX operator set and
       assignment side effects.
       why: psh errors out on it today; every counting loop in the corpus has to
