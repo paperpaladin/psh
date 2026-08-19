@@ -164,7 +164,7 @@ Honest list. None of these are "coming soon". They are absent today.
   error in psh, because the scanner that copies a `$(...)` construct verbatim
   counts parentheses and tracks quoting but knows nothing about here-document
   bodies, so the stray `)` ends the copy early. The leftover text goes to the
-  outer parser, which is why both shapes tried so far come out as a syntax
+  outer parser, so both shapes tried so far come out as a syntax
   error and exit 2, not as a wrong string, but that is an observation
   about those two, not a guarantee about every body.
 - Backquotes in a here-document body are refused, not substituted. dash
@@ -210,7 +210,7 @@ Honest list. None of these are "coming soon". They are absent today.
 - Tilde expansion is partial. `~user` is not supported, and a tilde after a
   `:` in an assignment (`PATH=~/bin:~/sbin`) is left literal.
 - psh leaks memory by design. Parse trees and expansion buffers are never
-  freed, which is why `make test-asan` disables LeakSanitizer. Fine for "run a
+  freed, and `make test-asan` disables LeakSanitizer for that reason. Fine for "run a
   script and exit"; not fine for a login shell.
 - Fixed limits: 32 stages per pipeline, 16 saved file descriptors per
   command.
@@ -273,7 +273,7 @@ same reason one level up: the lexer has to know that the `"` inside
 `"$(echo "a b")"` belongs to the substitution.
 
 Pipelines fork every stage, builtins included, so a builtin in a pipeline
-cannot touch the parent shell, which is exactly the surprise dash gives you
+cannot touch the parent shell, exactly the surprise dash gives you
 with `echo x | read v`. Builtins outside a pipeline run in the parent (otherwise
 `cd` would be useless), with their redirections saved through `F_DUPFD_CLOEXEC`
 and restored afterwards.
