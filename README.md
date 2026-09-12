@@ -135,8 +135,7 @@ at parse time the way dash refuses it. `unset -f` removes one. Variables are
 shared, not scoped, because POSIX functions have no locals. Recursion is capped
 at 1000 frames, which is dash's number and dash's exit status. The number is
 checked and not just asserted: `208-function-recursion-500-deep.sh` recurses
-500 deep and must complete, so a cap below 500 fails the suite. The
-infinite-recursion case alone could not tell, it trips any cap, and
+500 deep and must complete, so a cap below 500 fails the suite. That case alone could not tell, it trips any cap, and
 `MAXFUNCDEPTH=50` passed all 207 of the old corpus.
 
 Here-documents: `<<WORD`, `<<-WORD` with leading tabs stripped from both the
