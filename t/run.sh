@@ -27,12 +27,27 @@ work=$tmp/w
 out=$tmp/o
 mkdir -p "$out"
 
+# A case that needs positional parameters on its command line gets them from
+# a sidecar file NAME.args, one argument per line, read verbatim: that is how
+# an argument can hold a space, a tab, a glob character or no bytes at all,
+# none of which survive a `set -- $(cat ...)`. Both shells get the same list.
+#
+# Inline rather than a function on purpose: `set --` inside a shell function
+# sets that function's parameters, and they are discarded when it returns.
+CANARY=209-positional-from-argv.sh
+
 for f in "$here"/cases/*.sh; do
 	name=$(basename "$f")
 
+	set --
+	if [ -f "${f%.sh}.args" ]; then
+		while IFS= read -r a; do set -- "$@" "$a"; done < "${f%.sh}.args"
+	fi
+
 	rm -rf "$work"; mkdir -p "$work"
-	( cd "$work" && "$dash" "$f" ) >"$out/d.out" 2>"$out/d.err"
+	( cd "$work" && "$dash" "$f" "$@" ) >"$out/d.out" 2>"$out/d.err"
 	ds=$?
+	[ "$name" = "$CANARY" ] && cp "$out/d.out" "$out/canary.out"
 
 	# dash's own parse/feature refusal -> not a verdict we can use.
 	if [ "$ds" -eq 2 ] && grep -qi 'syntax error\|unexpected' "$out/d.err"; then
@@ -42,7 +57,7 @@ for f in "$here"/cases/*.sh; do
 	fi
 
 	rm -rf "$work"; mkdir -p "$work"
-	( cd "$work" && "$psh" "$f" ) >"$out/p.out" 2>"$out/p.err"
+	( cd "$work" && "$psh" "$f" "$@" ) >"$out/p.out" 2>"$out/p.err"
 	ps=$?
 
 	if [ "$ds" -eq "$ps" ] && cmp -s "$out/d.out" "$out/p.out"; then
@@ -72,11 +87,13 @@ done
 # which is how 207 of 207 agreement sat on top of it.
 EXPANSION_REFUSALS=0
 for form in 'n=xxx; echo "${n#x}"' 'n=xxx; echo "${n%x}"' \
-            'echo "${n:=d}"' 'echo "${n:?w}"'; do
+            'echo "${n:=d}"' 'echo "${n:?w}"' \
+            'set -e; false; echo reached' 'set -u; echo "$nope"' \
+            'set' 'set +x'; do
 	EXPANSION_REFUSALS=$((EXPANSION_REFUSALS + 1))
 	echo "$form" > "$out/exp.sh"
 	( cd "$work" && "$psh" "$out/exp.sh" ) >"$out/e.out" 2>"$out/e.err"
-	if grep -q 'unsupported expansion' "$out/e.err"; then
+	if grep -q 'unsupported expansion\|unsupported option\|is unsupported' "$out/e.err"; then
 		agree=$((agree + 1))
 		[ -n "${V:-}" ] && echo "ok       refuses: $form"
 	else
@@ -101,7 +118,7 @@ echo "$agree agree, $disagree disagree, $skipped skipped"
 # pinned rather than floored for the same reason as wasmi's: a floor only
 # catches an empty directory, and this number is the "208 agree" that INDEX.md
 # quotes. When a case is added deliberately, this moves in the same commit.
-CASES_EXPECTED=208
+CASES_EXPECTED=242
 MAX_SKIPPED=10
 
 cases=$(ls "$here"/cases/*.sh 2>/dev/null | wc -l)
@@ -121,6 +138,33 @@ if [ "$skipped" -gt "$MAX_SKIPPED" ]; then
 	echo "run.sh: dash rejected $skipped of $cases cases, more than the $MAX_SKIPPED" >&2
 	echo "  allowed. The oracle is not answering, so agreement means nothing." >&2
 	echo "  Check that \$DASH ($dash) is a working dash." >&2
+	exit 1
+fi
+
+# The .args sidecar cannot be checked by agreement: if the loop above never
+# read it, both shells would see zero arguments and agree with each other all
+# day. So the canary case's dash output AS THE LOOP PRODUCED IT is compared
+# against a deliberate no-argument run of the same script, and the two are
+# required to differ.
+#
+# An earlier version of this check read the sidecar itself and compared two
+# fresh dash runs. It proved the sidecar was not empty and nothing else:
+# deleting the sidecar read from the loop left it green.
+canary=$here/cases/$CANARY
+if [ ! -f "${canary%.sh}.args" ]; then
+	echo "run.sh: the canary $CANARY has no .args sidecar" >&2
+	exit 1
+fi
+if [ ! -f "$out/canary.out" ]; then
+	echo "run.sh: the canary $CANARY never ran" >&2
+	exit 1
+fi
+rm -rf "$work"; mkdir -p "$work"
+( cd "$work" && "$dash" "$canary" ) >"$out/c2.out" 2>/dev/null
+if cmp -s "$out/canary.out" "$out/c2.out"; then
+	echo "run.sh: the canary produced the same output with and without its" >&2
+	echo "  .args sidecar, so the positional-parameter cases are running" >&2
+	echo "  with no arguments at all." >&2
 	exit 1
 fi
 

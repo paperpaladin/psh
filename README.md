@@ -9,7 +9,7 @@ A POSIX shell subset in one C file, kept honest by differential testing against
 $ make test
 gcc -std=c11 -Wall -Wextra -O2 -o psh psh.c
 ./t/run.sh
-212 agree, 0 disagree, 0 skipped
+250 agree, 0 disagree, 0 skipped
 ```
 
 ```
@@ -17,7 +17,7 @@ $ make test-asan
 gcc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
 	-fno-omit-frame-pointer -o psh-asan psh.c
 ASAN_OPTIONS=detect_leaks=0 PSH=./psh-asan ./t/run.sh
-212 agree, 0 disagree, 0 skipped
+250 agree, 0 disagree, 0 skipped
 ```
 
 Run a script or a string:
@@ -44,12 +44,12 @@ So psh is organised around that question. There is no spec-reading step and no
 `t/cases/` compares psh's output against dash's, and every corner that psh
 skips is skipped on purpose, named below, and not quietly papered over.
 
-The interesting artefact is therefore not the shell. It is the 208-script
-corpus, plus four checks that psh refuses the expansions it has not
-implemented, and the fact that the number on the last line of `make test`
-is a real measurement, not a self-assessment. The corpus size is
-pinned, because a run over an empty corpus and a run over all of it both used
-to print `0 disagree` and exit 0.
+The interesting artefact is therefore not the shell. It is the 242-script
+corpus, plus eight checks that psh refuses the expansions and the `set`
+options it has not implemented, and the fact that the number on the last line
+of `make test` is a real measurement, not a self-assessment. The corpus size
+is pinned, because a run over an empty corpus and a run over all of it both
+used to print `0 disagree` and exit 0.
 
 ## The oracle
 
@@ -74,6 +74,20 @@ not zero.
 
 `DASH=/path/to/dash` and `PSH=/path/to/psh` override either side; `V=1` lists
 the passing cases too.
+
+A case that needs positional parameters on its own command line gets them
+from a sidecar file next to it, `NAME.args`, one argument per line read
+verbatim, so an argument can contain a space, a tab, a glob character or no
+bytes at all. Both shells get the same list.
+
+That mechanism cannot be checked by agreement: if the sidecar were never
+read, both shells would see zero arguments and agree with each other. So
+`209-positional-from-argv.sh` is a canary, and after the corpus run the
+harness re-runs it under dash with no arguments and requires the output to
+differ from the one the loop produced. The first version of this check read
+the sidecar itself and compared two fresh dash runs; it proved the file was
+not empty and nothing else, and deleting the sidecar read from the loop left
+it green.
 
 ### Things dash does that were genuinely surprising
 
@@ -104,6 +118,19 @@ a numbered case in the corpus:
 - `${#}` is `$#`, i.e. `0`: not the length of a variable named `#`.
 - `IFS=` disables field splitting entirely instead of splitting between
   every character, so `IFS=; x="a b"; for w in $x` iterates once.
+- `shift` past the end is not a status-1 failure. It is an error in a POSIX
+  special builtin, so dash prints a diagnostic and the script STOPS, with
+  status 2. `set -- a b; shift 3; echo hi` prints nothing.
+- Unquoted `$*` is not the join-then-split that POSIX describes. With
+  `IFS=:` and the parameters `a`, `""`, `b`, joining gives `a::b` and
+  splitting that gives three fields; dash gives two, the same two as `$@`.
+  Unquoted `$@` and unquoted `$*` are the same thing in dash.
+- `${#*}` and `${#@}` are the length in bytes of `"$*"`, not the number of
+  parameters: with `a b c` they are 5.
+- The quotes around `"$@"` disappear with it when there are no parameters,
+  so `f "$@"` passes zero arguments where `f ""` passes one. Only those
+  quotes: `f ""$@` still passes one empty argument.
+- `$10` is `$1` followed by a literal `0`. The tenth parameter is `${10}`.
 
 ## Works
 
@@ -123,7 +150,26 @@ individual bytes. Command substitution `$(...)`, nested, with trailing newlines
 stripped and its exit status visible to an assignment. Tilde expansion for a
 leading `~` or `~/`. `if`/`elif`/`else`/`fi`, `while`, `until`, `for ... in`,
 `break [n]`, `continue [n]`. Builtins `cd` (including `cd -`), `exit`, `export`,
-`echo`, `true`, `false`, `pwd`, `read`, `unset`, `:`.
+`echo`, `true`, `false`, `pwd`, `read`, `unset`, `:`, `set --`, `shift`.
+
+Positional parameters. `$0` is the script path as it was given on the command
+line, or the shell's own `argv[0]` under `-c`; `$1`..`$9` and `${10}` upwards
+are the arguments, `$#` is how many, and `${1:-w}`, `${1:+w}`, `${#1}` work on
+them like any other parameter. `"$@"` is one field per parameter whatever IFS
+says, `"$*"` is one field with the parameters joined by the first byte of IFS,
+and the unquoted `$@` and `$*` are one field per parameter with ordinary IFS
+splitting applied to each and empty parameters dropped. `set --` replaces the
+whole list, `set a b` does too, and `shift [n]` drops from the front. A
+function call replaces the parameters for the duration and restores them on
+return, so `shift` inside a function shifts the function's arguments; `$0` is
+not replaced, which is what dash does.
+
+The field boundary that `"$@"` needs is carried in the per-byte quote-flag
+array described under Design, as a flag value of its own: 2 for a break from
+a quoted `"$@"`, where an empty field either side of it is a real empty
+argument, and 3 for a break from the unquoted forms, where it is nothing.
+That is the whole of the difference between `f "$@"` and `f $@` on the
+parameters `a`, `""`, `b`: three arguments and two.
 
 Shell functions: `name() compound-command`, with the body able to carry its own
 redirections: `f() { echo x; } > file` redirects on every call, not once at
@@ -170,7 +216,11 @@ Honest list. None of these are "coming soon". They are absent today.
   delimiter nothing expands and a backquote really is a literal, so there it is
   left alone.
 - No `trap`.
-- No `set`. No `set -e`, `-u`, `-x`, and no `set --`.
+- No `set` options. `set -e`, `set -u`, `set -x` and bare `set` (which lists
+  every variable in dash) are refused with a diagnostic and status 2, not
+  accepted and ignored: a `set -e` that silently does nothing keeps the
+  script running past the failure it was asked to stop at. `set --` and
+  `set a b` are implemented. Four checks in the harness assert the refusal.
 - `${VAR#pat}` and `${VAR%pat}` are refused, and neither quietly expands to nothing. They are
   not implemented (PLAN item 201), and until recently the name scan in
   `expand_brace` stopped only at `:`, `-` and `+`, so `${n#x}` was read as a
@@ -179,13 +229,25 @@ Honest list. None of these are "coming soon". They are absent today.
   for exactly this reason. Four checks in the harness now assert the refusal,
   since an unimplemented expansion can never agree with dash and so cannot
   live in the corpus.
-- No positional parameters, which makes functions much less useful than they
-  look. `$1`..`$9` expand to empty and `$#` expands to `0`. That is what dash
-  does for a script invoked without arguments, so the corpus agrees, and it
-  means a function cannot take an argument. `f() { echo "$1"; }; f hi` prints a
-  blank line here and `hi` in dash. This is the next item in `PLAN.md` for
-  exactly that reason: functions came first because the plan said so, and the
-  pairing is what makes either worth having.
+- `$0` under `-c` is not oracle-tested. psh uses its own `argv[0]` when no
+  operand follows the string and the operand when one does, which is dash's
+  rule, but `t/run.sh` only ever runs script files, so nothing in the corpus
+  checks it. The script case is checked: both shells are handed the same
+  path and `210-positional-dollar-zero.sh` compares what they print.
+- `$*` and `$@` are not settable or unsettable, and `${#*}` is the only
+  `${#...}` form over them. `${*%pat}` and friends are refused along with
+  every other trimming form.
+- The quote cancellation around an empty `"$@"` is matched as the two literal
+  spellings `"$@"` and `"${@}"`, not tracked through the expansion, so
+  `"${1+"$@"}"` with no parameters leaves one empty argument here and none in
+  dash. Nothing in the corpus covers that shape, which makes it an untested
+  divergence rather than a measured one.
+- `unset 1` diverges, and did before this item: dash calls it a bad variable
+  name and, `unset` being a special builtin, ENDS the script with status 2.
+  psh prints its own diagnostic and carries on with status 0. The same is
+  true of every other bad name handed to `unset`. It is left alone here
+  because it is a property of `unset`, not of positional parameters, and
+  fixing it means deciding how every builtin reports a special-builtin error.
 - No local variables. POSIX has none and dash's `local` is an extension, so
   a function that sets a variable changes the caller's. Asserted explicitly: `191-function-globals.sh` compares that against dash.
 - `break` inside a function can reach the caller's loops. `loopdepth` is
@@ -198,7 +260,7 @@ Honest list. None of these are "coming soon". They are absent today.
 - No `case`/`esac`.
 - No backquotes. `` ` `` is a hard error; use `$()`.
 - No `${VAR%pat}`, `${VAR#pat}`, `${VAR:=w}`, `${VAR:?w}`.
-- No `eval`, `exec`, `.`/`source`, `alias`, `getopts`, `shift`, `umask`,
+- No `eval`, `exec`, `.`/`source`, `alias`, `getopts`, `umask`,
   `hash`, `times`, `ulimit`, `readonly`.
 - No interactive features. No prompt, no line editing, no history. Reading
   from a tty works only because stdin happens to be a file descriptor.
@@ -214,7 +276,7 @@ Honest list. None of these are "coming soon". They are absent today.
 
 ## Design
 
-One file, ~2200 lines, six stages that each hand a single data structure to the
+One file, ~2460 lines, six stages that each hand a single data structure to the
 next:
 
 ```
@@ -258,7 +320,9 @@ Everyone gets this wrong, and they get it wrong the same way: they expand into
 a `char *` and then split and glob the result. That loses the information step 2
 and step 3 need. `x="a b"; cmd $x` must pass two arguments while `cmd "$x"`
 passes one; `x='*'; echo $x` must glob while `echo "$x"` must not. Both pairs
-are byte-identical after step 1. So `expand_into()` writes two parallel buffers,
+are byte-identical after step 1. `"$@"` is the sharpest case of the same
+thing: `set -- "a b" c` makes `f "$@"` two arguments and `f "$*"` one, and
+after step 1 those differ by nothing but a flag byte. So `expand_into()` writes two parallel buffers,
 `text` and `flg`, where `flg[i] == 1` means "byte `i` is literal, exempt from
 splitting and from globbing", and `glob_field()` backslash-escapes exactly the
 flagged metacharacters before handing the pattern to `glob(3)`.

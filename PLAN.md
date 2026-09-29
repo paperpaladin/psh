@@ -11,9 +11,10 @@ backslash quoting; pipelines (`|`); redirections (`<`, `>`, `>>`, `N>`, `N>&M`);
 `&&`, `||`, `;`, `!`. Here-documents (`<<`, `<<-`, and the quoted-delimiter
 forms); subshells `( )` and brace groups `{ }`; variable
 assignment, `$VAR`, `${VAR}`, `${VAR:-w}`, `${VAR:+w}`, `${#VAR}`, `$?`;
-pathname expansion through `glob(3)`; command substitution `$(...)`; the
+pathname expansion through `glob(3)`; command substitution `$(...)`;
+positional parameters `$0`, `$1`..`$9`, `${10}`, `$#`, `"$@"` and `$*`; the
 builtins `cd`, `exit`, `export`, `echo`, `true`, `false`, `pwd`, `read`, `:`,
-`break`, `continue`, `unset`, and the compound commands `if/elif/else/fi`,
+`break`, `continue`, `unset`, `shift`, `set --`, and the compound commands `if/elif/else/fi`,
 `while/do/done`, `until/do/done`, `for/in/do/done`.
 
 Out of scope, and deliberately so: everything in Non-goals below.
@@ -63,9 +64,11 @@ Ranked, strongest first:
   ownership handoff. `&` is a syntax error.
 - Shell functions (`name() { ... }`).
 - Here-strings (`<<<`). psh refuses them loudly. dash has none either.
-- `trap`, `set -e`/`set -u`/`set -x`/`set --`, `shift`, positional parameters
-  and `$@`/`$*`/`$1` (they expand to empty, as dash does when a
-  script is given no arguments).
+- `trap`, and the `set` options `set -e`/`set -u`/`set -x`. The options are
+  refused with a diagnostic rather than accepted and ignored, because a
+  `set -e` that silently does nothing runs the script past the failure it
+  asked to stop at. Bare `set`, which lists every variable in dash, is
+  refused for the same reason. `set --` itself is implemented.
 - Arithmetic expansion `$(( ))`. psh refuses it loudly instead of silently
   mis-evaluating it.
 - `case`/`esac`.
@@ -168,7 +171,7 @@ Ranked, strongest first:
       was the retctl break in the while loop, observable only when the loop
       condition has a side effect, which no case had, case 207 is that case
       and it kills it.
-- [ ] Positional parameters: `$1`..`$9`, `$#`, `"$@"` versus `$*`, `shift`,
+- [x] Positional parameters: `$1`..`$9`, `$#`, `"$@"` versus `$*`, `shift`,
       `set --`.
       why: `"$@"` is the one expansion that produces a *different number of
       fields* depending only on its quoting, which no other construct does, so
@@ -177,6 +180,25 @@ Ranked, strongest first:
       argument until this lands, so `f() { echo "$1"; }; f hi` prints a blank
       line here and `hi` in dash. That is the largest known divergence in the
       repo and it arrived with the previous item.
+      done: 34 cases, 208 -> 242, plus four more refusal checks for the `set`
+      options, 212 -> 250 verdicts. The field boundary rides in the quote-flag
+      array that already existed: flag 2 is a break from a quoted `"$@"` where
+      an empty field is a real empty argument, flag 3 a break from the
+      unquoted forms where it is nothing. Four guesses were wrong and dash
+      corrected all four. `shift` past the end is not a status-1 failure, it
+      is a special-builtin error that ENDS the script with status 2. Unquoted
+      `$*` is not POSIX's join-then-split: with `IFS=:` and the parameters
+      a "" b a join gives three fields and dash gives two, the same two as
+      `$@`. `${#*}` is the length of `$*`, 5 for three one-letter parameters,
+      not the count. And the quotes around `"$@"` cancel with it when there
+      are no parameters (`f "$@"` passes zero arguments where `f ""` passes
+      one) but only those quotes: `f ""$@` still passes one empty argument.
+      The harness grew a `NAME.args` sidecar, one
+      argument per line so an argument can hold a space, a tab or no bytes,
+      and a canary check, because a sidecar that is never read leaves both
+      shells with zero arguments and in perfect agreement: the first version
+      of that check compared two fresh dash runs and survived deleting the
+      sidecar read from the loop. 26 mutations, 26 caught, no survivors.
 - [ ] `set -e` semantics, exactly: which commands are exempt (conditions of
       `if`/`while`/`until`, operands of `&&`/`||`, the body of `!`), and how it
       propagates into subshells.
