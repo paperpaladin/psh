@@ -93,6 +93,73 @@ static void vpush(Vec *a, char *s) {
 }
 
 /* ------------------------------------------------------------- variables */
+typedef struct Var {
+	struct Var *next;
+	char *name;
+	char *val;
+	int exported;
+} Var;
+
+static Var *vars;
+extern char **environ;
+
+static Var *vfind(const char *name) {
+	for (Var *v = vars; v; v = v->next)
+		if (!strcmp(v->name, name)) return v;
+	return NULL;
+}
+
+static const char *getvar(const char *name) {
+	Var *v = vfind(name);
+	return v ? v->val : NULL;
+}
+
+static void setvar(const char *name, const char *val) {
+	Var *v = vfind(name);
+	if (!v) {
+		v = xmalloc(sizeof *v);
+		v->name = xstrdup(name);
+		v->val = NULL;
+		v->exported = 0;
+		v->next = vars;
+		vars = v;
+	}
+	free(v->val);
+	v->val = xstrdup(val);
+	/* Exported vars live in environ too, so execvp(3) hands them to the
+	 * child without us rebuilding an envp by hand. */
+	if (v->exported) setenv(v->name, v->val, 1);
+}
+
+static void exportvar(const char *name) {
+	Var *v = vfind(name);
+	if (!v) {
+		setvar(name, "");
+		v = vfind(name);
+	}
+	v->exported = 1;
+	setenv(v->name, v->val, 1);
+}
+
+static void vars_init(void) {
+	for (char **e = environ; *e; e++) {
+		char *eq = strchr(*e, '=');
+		if (!eq) continue;
+		char *name = xmalloc((size_t)(eq - *e) + 1);
+		memcpy(name, *e, (size_t)(eq - *e));
+		name[eq - *e] = 0;
+		setvar(name, eq + 1);
+		vfind(name)->exported = 1;
+		free(name);
+	}
+}
+
+static int valid_name(const char *s, size_t n) {
+	if (!n || (!isalpha((unsigned char)s[0]) && s[0] != '_')) return 0;
+	for (size_t i = 1; i < n; i++)
+		if (!isalnum((unsigned char)s[i]) && s[i] != '_') return 0;
+	return 1;
+}
 
 /* ---------------------------------------------------------------- lexer */
 
@@ -266,6 +333,17 @@ static int lex(const char *p) {
 				quoted = 1;
 				continue;
 			}
+			if (c == '$' && p[1] == '{') {
+				sput(&w, '$');
+				p++;
+				p = copy_nested(p, &w, '{', '}');
+				if (!p) {
+					fprintf(stderr, "%s: unterminated ${\n", progname);
+					return -1;
+				}
+				quoted = 1;
+				continue;
+			}
 			if (strchr(WORDBREAK, c)) break;
 			sput(&w, c);
 			p++;
@@ -288,6 +366,7 @@ typedef struct Node Node;
 struct Node {
 	int type;
 	Vec words; /* SIMPLE: argv, raw (unexpanded). FOR: the "in" list. */
+	Vec assigns; /* SIMPLE: NAME=raw-value prefixes */
 	Node *left, *right; /* SEQ / AND / OR / PIPE */
 	Node *cond, *body, *els;
 	char *var; /* FOR */
@@ -330,7 +409,11 @@ static Node *parse_command(void) {
 	int got = 0;
 	for (;;) {
 		if (cur()->type != TWORD) break;
-		{
+		/* NAME=value is an assignment only in the prefix position. */
+		char *eq = strchr(cur()->text, '=');
+		if (n->words.n == 0 && eq && valid_name(cur()->text, (size_t)(eq - cur()->text))) {
+			vpush(&n->assigns, xstrdup(cur()->text));
+		} else {
 			if (n->words.n == 0 && at_terminator()) break; /* keyword, not a word */
 			vpush(&n->words, xstrdup(cur()->text));
 		}
@@ -428,6 +511,16 @@ static void eput(Exp *e, int c, int quoted) {
 	sput(&e->flg, quoted ? 1 : 0);
 }
 
+static void eputs(Exp *e, const char *s, int quoted) {
+	while (*s) eput(e, *s++, quoted);
+}
+
+/* Handle one ${...} body (without the braces). */
+static void expand_braced(const char *b, Exp *e, int dq) {
+	const char *v = getvar(b);
+	if (v) eputs(e, v, dq);
+}
+
 /* Step 1: substitution pass. Fills e->text and the per-byte quoted flags. */
 static void expand_into(const char *p, Exp *e, int dq_init) {
 	int dq = dq_init;
@@ -465,11 +558,65 @@ static void expand_into(const char *p, Exp *e, int dq_init) {
 			}
 			continue;
 		}
+		if (c == '$' && p[1]) {
+			char n = p[1];
+			if (n == '?') {
+				char num[16];
+				snprintf(num, sizeof num, "%d", status);
+				eputs(e, num, dq);
+				p += 2;
+				continue;
+			}
+			if (n == '#') { /* no positional parameters -> always 0 */
+				eputs(e, "0", dq);
+				p += 2;
+				continue;
+			}
+			if (isdigit((unsigned char)n)) { /* $1.. unset -> empty, as in dash */
+				p += 2;
+				continue;
+			}
+			if (n == '{') {
+				Str raw = {0};
+				const char *q = copy_nested(p + 1, &raw, '{', '}');
+				if (!q) {
+					fprintf(stderr, "%s: unterminated ${\n", progname);
+					p += 2;
+					continue;
+				}
+				raw.p[raw.n - 1] = 0;
+				expand_braced(raw.p + 1, e, dq);
+				free(raw.p);
+				p = q;
+				continue;
+			}
+			if (isalpha((unsigned char)n) || n == '_') {
+				const char *s = p + 1;
+				size_t k = 0;
+				while (s[k] && (isalnum((unsigned char)s[k]) || s[k] == '_')) k++;
+				char *name = xmalloc(k + 1);
+				memcpy(name, s, k);
+				name[k] = 0;
+				const char *v = getvar(name);
+				if (v) eputs(e, v, dq);
+				free(name);
+				p = s + k;
+				continue;
+			}
+			eput(e, '$', dq);
+			p++;
+			continue;
+		}
 		/* Inside double quotes, glob metacharacters are literal: hence the
 		 * quoted flag follows dq for ordinary bytes too. */
 		eput(e, c, dq);
 		p++;
 	}
+}
+
+static const char *ifs_value(void) {
+	const char *v = getvar("IFS");
+	return v ? v : " \t\n";
 }
 
 enum { EX_FULL, EX_NOSPLIT };
@@ -482,13 +629,48 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 	const char *t = e.text.p ? e.text.p : "";
 	const char *f = e.flg.p ? e.flg.p : "";
 
-	/* Before field splitting exists, a word is exactly one field: expansion
-	 * does quote removal and nothing else. */
-	(void)mode;
-	Str lit = {0};
-	for (size_t i = 0; i < n; i++) sput(&lit, t[i]);
-	vpush(out, lit.p ? lit.p : xstrdup(""));
-	(void)f;
+	if (mode == EX_NOSPLIT) {
+		Str s = {0};
+		for (size_t i = 0; i < n; i++) sput(&s, t[i]);
+		vpush(out, s.p ? s.p : xstrdup(""));
+		free(e.text.p);
+		free(e.flg.p);
+		return;
+	}
+
+	/* Step 2: field splitting. IFS whitespace runs collapse and leading or
+	 * trailing runs produce no empty fields; a non-whitespace IFS byte is a
+	 * hard delimiter. Only unquoted bytes delimit. */
+	if (n == 0) {
+		if (exp_sawquote) vpush(out, xstrdup(""));
+		free(e.text.p);
+		free(e.flg.p);
+		return;
+	}
+	const char *ifs = ifs_value();
+	size_t i = 0;
+	int any = 0;
+	while (i < n) {
+		while (i < n && !f[i] && strchr(ifs, t[i]) && isspace((unsigned char)t[i])) i++;
+		if (i >= n) break;
+		size_t start = i;
+		while (i < n && !(!f[i] && strchr(ifs, t[i]))) i++;
+		{
+			Str lit = {0};
+			for (size_t k = start; k < i; k++) sput(&lit, t[k]);
+			vpush(out, lit.p ? lit.p : xstrdup(""));
+		}
+		any = 1;
+		if (i < n && !f[i] && !isspace((unsigned char)t[i])) {
+			i++; /* consume the hard delimiter; an empty field may follow */
+			if (i == n) {
+				vpush(out, xstrdup(""));
+			}
+		}
+	}
+	/* A word that expands to nothing at all contributes no field -- this is
+	 * why `cmd $unset` runs cmd with zero arguments, not with "". */
+	(void)any;
 	free(e.text.p);
 	free(e.flg.p);
 }
@@ -498,6 +680,18 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 /* ------------------------------------------------------------- execution */
 
 static int exec_node(Node *n);
+
+static void do_assigns(Node *n, int export_them) {
+	for (int i = 0; i < n->assigns.n; i++) {
+		char *eq = strchr(n->assigns.v[i], '=');
+		*eq = 0;
+		Vec w = {0};
+		expand_word(eq + 1, &w, EX_NOSPLIT); /* no splitting, no globbing */
+		setvar(n->assigns.v[i], w.n ? w.v[0] : "");
+		if (export_them) exportvar(n->assigns.v[i]);
+		*eq = '=';
+	}
+}
 
 static void exec_external(char **argv) {
 	execvp(argv[0], argv);
@@ -517,10 +711,17 @@ static int exec_simple(Node *n, int in_child) {
 	if (argv.n == 0) {
 		/* No command word. Redirections still happen (`> f` creates f) and
 		 * assignments apply to the current shell. */
+		/* A command with no command word succeeds (status 0) -- EXCEPT that a
+		 * command substitution in the assignment leaves its own status behind,
+		 * which is the only way `x=$(false)` can be detected. Hence: zero
+		 * first, then let do_assigns overwrite it. */
+		status = 0;
+		do_assigns(n, 0);
 		return status;
 	}
 
 	if (in_child) {
+		do_assigns(n, 1);
 		exec_external(argv.v);
 	}
 
@@ -529,6 +730,7 @@ static int exec_simple(Node *n, int in_child) {
 	if (pid < 0) fatal("fork: %s", strerror(errno));
 	if (pid == 0) {
 		signal(SIGINT, SIG_DFL);
+		do_assigns(n, 1);
 		exec_external(argv.v);
 	}
 	int st = 0;
@@ -593,6 +795,9 @@ static char *slurp(FILE *f) {
 }
 
 int main(int argc, char **argv) {
+	vars_init();
+	char cwd[PATH_MAX];
+	if (getcwd(cwd, sizeof cwd)) setvar("PWD", cwd);
 	signal(SIGINT, SIG_IGN); /* shortcut: no job control, no trap; the shell
 	                          * simply ignores SIGINT and children get the
 	                          * default. Ceiling: Ctrl-C in an interactive
