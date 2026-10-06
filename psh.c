@@ -133,6 +133,20 @@ static void setvar(const char *name, const char *val) {
 	if (v->exported) setenv(v->name, v->val, 1);
 }
 
+static void unsetvar(const char *name) {
+	Var **pp = &vars;
+	for (Var *v = *pp; v; pp = &v->next, v = v->next)
+		if (!strcmp(v->name, name)) {
+			*pp = v->next;
+			unsetenv(v->name);
+			free(v->name);
+			free(v->val);
+			free(v);
+			return;
+		}
+	unsetenv(name);
+}
+
 static void exportvar(const char *name) {
 	Var *v = vfind(name);
 	if (!v) {
@@ -935,6 +949,86 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 
 /* ------------------------------------------------------------- builtins */
 
+static int b_echo(char **av) {
+	int nflag = 0, first = 1;
+	int i = 1;
+	if (av[1] && !strcmp(av[1], "-n")) nflag = 1, i = 2;
+	for (; av[i]; i++) {
+		if (!first) putchar(' ');
+		first = 0;
+		/* dash's echo always interprets backslash escapes (no -e needed) and
+		 * \c aborts output including the trailing newline. We match dash,
+		 * not bash, because dash is the oracle. */
+		for (char *s = av[i]; *s; s++) {
+			if (*s != '\\') {
+				putchar(*s);
+				continue;
+			}
+			switch (s[1]) {
+			case 'a': putchar('\a'); s++; break;
+			case 'b': putchar('\b'); s++; break;
+			case 'c': fflush(stdout); return 0;
+			case 'f': putchar('\f'); s++; break;
+			case 'n': putchar('\n'); s++; break;
+			case 'r': putchar('\r'); s++; break;
+			case 't': putchar('\t'); s++; break;
+			case 'v': putchar('\v'); s++; break;
+			case '\\': putchar('\\'); s++; break;
+			case '0': {
+				int v = 0, k = 0;
+				s++;
+				while (k < 3 && s[1] >= '0' && s[1] <= '7') v = v * 8 + (s[1] - '0'), s++, k++;
+				putchar(v);
+				break;
+			}
+			default: putchar('\\'); break;
+			}
+		}
+	}
+	if (!nflag) putchar('\n');
+	fflush(stdout);
+	return 0;
+}
+
+static int b_pwd(char **av) {
+	(void)av;
+	char buf[PATH_MAX];
+	if (!getcwd(buf, sizeof buf)) {
+		fprintf(stderr, "%s: pwd: %s\n", progname, strerror(errno));
+		return 1;
+	}
+	printf("%s\n", buf);
+	fflush(stdout);
+	return 0;
+}
+
+static int b_true(char **av) {
+	(void)av;
+	return 0;
+}
+static int b_false(char **av) {
+	(void)av;
+	return 1;
+}
+static int b_colon(char **av) {
+	(void)av;
+	return 0;
+}
+
+static struct {
+	const char *name;
+	int (*fn)(char **);
+} builtins[] = {
+    {"echo", b_echo}, {"true", b_true}, {"false", b_false},
+    {"pwd", b_pwd},   {":", b_colon},
+};
+
+static int builtin_index(const char *name) {
+	for (size_t i = 0; i < sizeof builtins / sizeof *builtins; i++)
+		if (!strcmp(builtins[i].name, name)) return (int)i;
+	return -1;
+}
+
 /* ------------------------------------------------------------- execution */
 
 typedef struct {
@@ -1067,9 +1161,48 @@ static int exec_simple(Node *n, int in_child) {
 		return status;
 	}
 
+	int bi = builtin_index(argv.v[0]);
+	if (bi >= 0 && !in_child) {
+		FdSave sv = {0};
+		if (n->nredirs && apply_redirs(n->redirs, n->nredirs, &sv) < 0) {
+			restore_fds(&sv);
+			return 2;
+		}
+		/* `X=1 echo hi` must NOT leave X set afterwards, so snapshot the
+		 * named variables (including "was unset") and put them back. The
+		 * exception is POSIX's special builtins, where the assignment
+		 * persists -- but psh has none of those that take prefixes, so we
+		 * restore unconditionally. */
+		Vec old = {0};
+		for (int i = 0; i < n->assigns.n; i++) {
+			char *eq = strchr(n->assigns.v[i], '=');
+			*eq = 0;
+			const char *v = getvar(n->assigns.v[i]);
+			vpush(&old, v ? xstrdup(v) : NULL);
+			*eq = '=';
+		}
+		do_assigns(n, 1); /* prefixes are exported to the command's env */
+		int st = builtins[bi].fn(argv.v);
+		fflush(stdout);
+		for (int i = 0; i < n->assigns.n; i++) {
+			char *eq = strchr(n->assigns.v[i], '=');
+			*eq = 0;
+			if (old.v[i]) setvar(n->assigns.v[i], old.v[i]);
+			else unsetvar(n->assigns.v[i]);
+			*eq = '=';
+		}
+		if (n->nredirs) restore_fds(&sv);
+		return st;
+	}
+
 	if (in_child) {
 		if (apply_redirs(n->redirs, n->nredirs, NULL) < 0) _exit(2);
 		do_assigns(n, 1);
+		if (bi >= 0) {
+			int st = builtins[bi].fn(argv.v);
+			fflush(NULL);
+			_exit(st);
+		}
 		exec_external(argv.v);
 	}
 
