@@ -1,0 +1,2 @@
+unset neverset
+echo $?
