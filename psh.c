@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <limits.h>
 #include <signal.h>
@@ -361,6 +362,14 @@ static int lex(const char *p) {
 
 /* --------------------------------------------------------------- parser */
 
+enum { R_IN, R_OUT, R_APPEND, R_DUP };
+
+typedef struct {
+	int fd;
+	int how;
+	char *word;
+} Redir;
+
 enum { N_SIMPLE, N_SEQ, N_AND, N_OR, N_PIPE, N_NOT, N_SUBSHELL, N_GROUP, N_IF, N_WHILE, N_FOR };
 
 typedef struct Node Node;
@@ -368,6 +377,8 @@ struct Node {
 	int type;
 	Vec words; /* SIMPLE: argv, raw (unexpanded). FOR: the "in" list. */
 	Vec assigns; /* SIMPLE: NAME=raw-value prefixes */
+	Redir *redirs;
+	int nredirs;
 	Node *left, *right; /* SEQ / AND / OR / PIPE */
 	Node *cond, *body, *els;
 	char *var; /* FOR */
@@ -404,11 +415,48 @@ static int at_terminator(void) {
 
 static Node *parse_list(void);
 
+static void push_redir(Node *n, int fd, int how, const char *word) {
+	n->redirs = xrealloc(n->redirs, (size_t)(n->nredirs + 1) * sizeof *n->redirs);
+	n->redirs[n->nredirs].fd = fd;
+	n->redirs[n->nredirs].how = how;
+	n->redirs[n->nredirs].word = xstrdup(word);
+	n->nredirs++;
+}
+
+/* Returns 1 if a redirection was consumed, 0 if none present, -1 on error. */
+static int parse_redir(Node *n) {
+	int fd = -1;
+	if (cur()->type == TIONUM) {
+		fd = atoi(cur()->text);
+		adv();
+	} else if (!isop("<") && !isop(">") && !isop(">>") && !isop(">&") && !isop("<&")) {
+		return 0;
+	}
+	int how;
+	if (isop("<")) how = R_IN, fd = fd < 0 ? 0 : fd;
+	else if (isop(">")) how = R_OUT, fd = fd < 0 ? 1 : fd;
+	else if (isop(">>")) how = R_APPEND, fd = fd < 0 ? 1 : fd;
+	else if (isop(">&")) how = R_DUP, fd = fd < 0 ? 1 : fd;
+	else if (isop("<&")) how = R_DUP, fd = fd < 0 ? 0 : fd;
+	else return perr(cur()->text);
+	adv();
+	if (cur()->type != TWORD) return perr(cur()->text);
+	push_redir(n, fd, how, cur()->text);
+	adv();
+	return 1;
+}
+
 static Node *parse_command(void) {
 
 	Node *n = nnew(N_SIMPLE);
 	int got = 0;
 	for (;;) {
+		int r = parse_redir(n);
+		if (r < 0) return NULL;
+		if (r) {
+			got = 1;
+			continue;
+		}
 		if (cur()->type != TWORD) break;
 		/* NAME=value is an assignment only in the prefix position. */
 		char *eq = strchr(cur()->text, '=');
@@ -709,6 +757,87 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 
 /* ------------------------------------------------------------- execution */
 
+typedef struct {
+	int fd[16];
+	int saved[16];
+	int n;
+} FdSave;
+
+static int apply_redirs(Redir *r, int n, FdSave *sv) {
+	if (sv) sv->n = 0;
+	for (int i = 0; i < n; i++) {
+		Vec w = {0};
+		expand_word(r[i].word, &w, EX_NOSPLIT);
+		if (w.n != 1) {
+			fflush(stdout);
+			fprintf(stderr, "%s: ambiguous redirect\n", progname);
+			return -1;
+		}
+		if (r[i].how == R_DUP) {
+			/* `2>&1` and friends. Only a digit or "-" is accepted; psh has no
+			 * named-fd tricks. Saving happens before the dup2 so a builtin's
+			 * redirection can be undone. */
+			int src;
+			if (!strcmp(w.v[0], "-")) src = -1;
+			else {
+				char *end;
+				long v = strtol(w.v[0], &end, 10);
+				if (*end || end == w.v[0]) {
+					fflush(stdout);
+					fprintf(stderr, "%s: %s: bad fd\n", progname, w.v[0]);
+					return -1;
+				}
+				src = (int)v;
+			}
+			if (sv && sv->n < 16) {
+				sv->fd[sv->n] = r[i].fd;
+				sv->saved[sv->n] = fcntl(r[i].fd, F_DUPFD_CLOEXEC, 10);
+				sv->n++;
+			}
+			fflush(NULL);
+			if (src < 0) close(r[i].fd);
+			else if (dup2(src, r[i].fd) < 0) {
+				fprintf(stderr, "%s: %d: %s\n", progname, src, strerror(errno));
+				return -1;
+			}
+			continue;
+		}
+		int fd;
+		if (r[i].how == R_IN) fd = open(w.v[0], O_RDONLY);
+		else if (r[i].how == R_OUT) fd = open(w.v[0], O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		else fd = open(w.v[0], O_WRONLY | O_CREAT | O_APPEND, 0666);
+		if (fd < 0) {
+			fflush(stdout);
+			fprintf(stderr, "%s: %s: %s\n", progname, w.v[0], strerror(errno));
+			return -1;
+		}
+		if (sv && sv->n < 16) {
+			sv->fd[sv->n] = r[i].fd;
+			sv->saved[sv->n] = fcntl(r[i].fd, F_DUPFD_CLOEXEC, 10);
+			sv->n++;
+		}
+		if (fd != r[i].fd) {
+			fflush(r[i].fd == 1 ? stdout : NULL);
+			dup2(fd, r[i].fd);
+			close(fd);
+		}
+	}
+	return 0;
+}
+
+static void restore_fds(FdSave *sv) {
+	fflush(NULL);
+	for (int i = sv->n - 1; i >= 0; i--) {
+		if (sv->saved[i] >= 0) {
+			dup2(sv->saved[i], sv->fd[i]);
+			close(sv->saved[i]);
+		} else {
+			close(sv->fd[i]);
+		}
+	}
+	sv->n = 0;
+}
+
 static int exec_node(Node *n);
 
 static void do_assigns(Node *n, int export_them) {
@@ -741,6 +870,14 @@ static int exec_simple(Node *n, int in_child) {
 	if (argv.n == 0) {
 		/* No command word. Redirections still happen (`> f` creates f) and
 		 * assignments apply to the current shell. */
+		FdSave sv = {0};
+		if (n->nredirs) {
+			if (apply_redirs(n->redirs, n->nredirs, &sv) < 0) {
+				restore_fds(&sv);
+				return 2;
+			}
+			restore_fds(&sv);
+		}
 		/* A command with no command word succeeds (status 0) -- EXCEPT that a
 		 * command substitution in the assignment leaves its own status behind,
 		 * which is the only way `x=$(false)` can be detected. Hence: zero
@@ -751,6 +888,7 @@ static int exec_simple(Node *n, int in_child) {
 	}
 
 	if (in_child) {
+		if (apply_redirs(n->redirs, n->nredirs, NULL) < 0) _exit(2);
 		do_assigns(n, 1);
 		exec_external(argv.v);
 	}
@@ -760,6 +898,7 @@ static int exec_simple(Node *n, int in_child) {
 	if (pid < 0) fatal("fork: %s", strerror(errno));
 	if (pid == 0) {
 		signal(SIGINT, SIG_DFL);
+		if (apply_redirs(n->redirs, n->nredirs, NULL) < 0) _exit(2);
 		do_assigns(n, 1);
 		exec_external(argv.v);
 	}
@@ -786,7 +925,15 @@ static int exec_node(Node *n) {
 	case N_SIMPLE:
 		return status = exec_simple(n, 0);
 	default: {
+		/* A compound command may carry its own redirections
+		 * (`while ...; done > f`); apply them around the whole body. */
+		FdSave sv = {0};
+		if (n->nredirs && apply_redirs(n->redirs, n->nredirs, &sv) < 0) {
+			restore_fds(&sv);
+			return status = 2;
+		}
 		int st = exec_compound_body(n);
+		if (n->nredirs) restore_fds(&sv);
 		return status = st;
 	}
 	}
