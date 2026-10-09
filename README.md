@@ -9,7 +9,7 @@ A POSIX shell subset in one C file, kept honest by differential testing against
 $ make test
 gcc -std=c11 -Wall -Wextra -O2 -o psh psh.c
 ./t/run.sh
-164 agree, 0 disagree, 0 skipped
+185 agree, 0 disagree, 0 skipped
 ```
 
 ```
@@ -17,7 +17,7 @@ $ make test-asan
 gcc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
 	-fno-omit-frame-pointer -o psh-asan psh.c
 ASAN_OPTIONS=detect_leaks=0 PSH=./psh-asan ./t/run.sh
-164 agree, 0 disagree, 0 skipped
+185 agree, 0 disagree, 0 skipped
 ```
 
 Run a script or a string:
@@ -44,7 +44,7 @@ So psh is organised around that question. There is no spec-reading step and no
 `t/cases/` compares psh's output against dash's, and every corner that psh
 skips is skipped on purpose, named below, and not quietly papered over.
 
-The interesting artefact is therefore not the shell. It is the 164-script
+The interesting artefact is therefore not the shell. It is the 185-script
 corpus and the fact that the number on the last line of `make test` is a real
 measurement rather than a self-assessment.
 
@@ -124,6 +124,16 @@ leading `~` or `~/`. `if`/`elif`/`else`/`fi`, `while`, `until`, `for ... in`,
 `break [n]`, `continue [n]`. Builtins `cd` (including `cd -`), `exit`, `export`,
 `echo`, `true`, `false`, `pwd`, `read`, `unset`, `:`.
 
+Here-documents: `<<WORD`, `<<-WORD` with leading tabs stripped from both the
+body and the delimiter line, and the quoted forms `<<'W'`, `<<"W"` and `<<\W`
+that suppress expansion of the body entirely. An unquoted delimiter means the
+body expands as if double-quoted, except that a quote character in the body is
+ordinary and a backslash before one keeps the backslash -- only `$`, `` ` ``,
+`\` and newline are escapable there. Multiple here-documents on one line are
+read in order; the body is stored unexpanded and re-expanded every time the
+redirection is applied, so a here-document inside a loop sees the current value
+of a variable on each iteration.
+
 ### What does not work
 
 Honest list. None of these are "coming soon"; they are absent today.
@@ -132,8 +142,23 @@ Honest list. None of these are "coming soon"; they are absent today.
   process groups, no terminal ownership. The shell ignores `SIGINT` outright, so
   Ctrl-C will not interrupt a loop -- it only reaches the foreground child.
 - **No functions.** `f() { ...; }` does not parse.
-- **No here-documents.** `<<` and `<<-` are syntax errors. This is the biggest
-  practical gap.
+- **No here-strings.** `<<<` is refused with a diagnostic rather than lexed as
+  `<<` with an empty delimiter, which would silently swallow the rest of the
+  file. dash has no `<<<` either.
+- **A here-document inside `$(...)` breaks on an unbalanced `)` in the body.**
+  `v=$(cat <<EOF` / `has ) paren` / `EOF` / `)` works in dash and is a syntax
+  error in psh, because the scanner that copies a `$(...)` construct verbatim
+  counts parentheses and tracks quoting but knows nothing about here-document
+  bodies, so the stray `)` ends the copy early. The leftover text goes to the
+  outer parser, which is why both shapes tried so far come out as a syntax
+  error and exit 2 rather than as a wrong string -- but that is an observation
+  about those two, not a guarantee about every body.
+- **Backquotes in a here-document body are refused, not substituted.** dash
+  expands `` ` `` there. psh rejects a backquote everywhere else, and an
+  expanding body is the one place where passing one through as a literal would
+  have been silently wrong, so it is a hard error instead. With a quoted
+  delimiter nothing expands and a backquote really is a literal, so there it is
+  left alone.
 - **No `trap`.**
 - **No `set`.** No `set -e`, `-u`, `-x`, and no `set --`.
 - **No positional parameters.** `$1`..`$9` expand to empty and `$#` expands to
@@ -162,7 +187,7 @@ Honest list. None of these are "coming soon"; they are absent today.
 
 ## Design
 
-One file, ~1700 lines, six stages that each hand a single data structure to the
+One file, ~1900 lines, six stages that each hand a single data structure to the
 next:
 
 ```

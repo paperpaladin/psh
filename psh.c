@@ -188,10 +188,18 @@ static int valid_name(const char *s, size_t n) {
 
 enum { TEOF, TWORD, TIONUM, TOP };
 
+/*
+ * A here-document delimiter token has its text replaced by the body once the
+ * body has been read, and `hdoc` records what kind of body it is. HD_LITERAL
+ * means the delimiter was quoted, so nothing in the body expands.
+ */
+enum { HD_NONE, HD_EXPAND, HD_LITERAL };
+
 typedef struct {
 	int type;
 	char *text;
 	int quoted; /* word contained a quote or an expansion -> never a keyword */
+	int hdoc;   /* HD_* : set on a here-document delimiter token */
 } Tok;
 
 static Tok *toks;
@@ -205,6 +213,7 @@ static void tpush(int type, const char *text, int quoted) {
 	toks[ntoks].type = type;
 	toks[ntoks].text = xstrdup(text);
 	toks[ntoks].quoted = quoted;
+	toks[ntoks].hdoc = HD_NONE;
 	ntoks++;
 }
 
@@ -285,8 +294,134 @@ static const char *copy_nested(const char *p, Str *w, char open, char close) {
 	return NULL;
 }
 
+/*
+ * Here-documents are the one redirection whose operand is nowhere in the token
+ * stream: `<<WORD` names a delimiter and the body is the lines that follow, so
+ * the lexer has to go and fetch it once the current line ends. lex() is handed
+ * the whole script at once, which makes that a forward scan from the newline
+ * rather than a second input channel -- and is the reason this fits in the
+ * lexer at all.
+ *
+ * Each pending entry remembers where its delimiter token sits so the body can
+ * be written back over it. By the time the parser reaches that token, its text
+ * is the body.
+ *
+ * shortcut: sixteen pending here-documents, which is sixteen on one line, not
+ * sixteen in a script. Grow to a Vec if a real script ever needs more.
+ */
+typedef struct {
+	int tok;     /* index of the delimiter token, to be overwritten */
+	char *delim; /* after quote removal */
+	int strip;   /* <<- : leading tabs come off body and delimiter alike */
+	int literal; /* delimiter was quoted, so the body does not expand */
+} Pending;
+
+static Pending pend[16];
+static int npend;
+
+static void pend_reset(void) {
+	while (npend) free(pend[--npend].delim);
+}
+
+/*
+ * POSIX 2.7.4: if any character of the delimiter word is quoted, the body is
+ * not expanded. The lexer keeps quote characters verbatim in the word text, so
+ * their presence is the test and their removal produces the delimiter.
+ */
+static char *here_delim(const char *raw, int *literal) {
+	Str d = {0};
+	const char *p = raw;
+	*literal = 0;
+	while (*p) {
+		if (*p == '\\' && p[1]) {
+			*literal = 1;
+			sput(&d, p[1]);
+			p += 2;
+			continue;
+		}
+		if (*p == '\'') {
+			*literal = 1;
+			p++;
+			while (*p && *p != '\'') sput(&d, *p++);
+			if (*p) p++;
+			continue;
+		}
+		if (*p == '"') {
+			*literal = 1;
+			p++;
+			continue;
+		}
+		sput(&d, *p++);
+	}
+	return d.p ? d.p : xstrdup("");
+}
+
+/*
+ * Read the body of every here-document opened on the line that just ended, in
+ * the order they were opened, and write each one over its delimiter token.
+ * Returns the scan position just past the last delimiter line, or NULL if the
+ * body is something psh refuses.
+ */
+static const char *read_heredocs(const char *p) {
+	for (int i = 0; i < npend; i++) {
+		Str body = {0};
+		size_t dn = strlen(pend[i].delim);
+		for (;;) {
+			const char *eol = strchr(p, '\n');
+			const char *line = p;
+			size_t len = eol ? (size_t)(eol - p) : strlen(p);
+			if (pend[i].strip)
+				while (len && *line == '\t') line++, len--;
+			if (len == dn && !memcmp(line, pend[i].delim, dn)) {
+				p = eol ? eol + 1 : line + len;
+				break;
+			}
+			/* Input ran out before the delimiter. dash takes that as the
+			 * delimiter and carries on; the warning it prints goes to
+			 * stderr, which the oracle does not compare. */
+			if (!*p) break;
+			for (size_t k = 0; k < len; k++) sput(&body, line[k]);
+			sput(&body, '\n');
+			if (!eol) {
+				p = line + len;
+				break;
+			}
+			p = eol + 1;
+		}
+		/* The lexer rejects a backquote outright everywhere else, and an
+		 * expanding body must not be the one place psh quietly passes one
+		 * through as a literal while dash substitutes it. A quoted
+		 * delimiter means nothing expands, so there it really is a
+		 * literal and is left alone. */
+		if (!pend[i].literal) {
+			for (const char *q = body.p; q && *q; q++) {
+				if (*q == '\\' && q[1]) {
+					q++;
+					continue;
+				}
+				if (*q == '`') {
+					fprintf(stderr,
+					        "%s: backquotes not supported, use $()\n",
+					        progname);
+					free(body.p);
+					return NULL;
+				}
+			}
+		}
+		free(toks[pend[i].tok].text);
+		toks[pend[i].tok].text = body.p ? body.p : xstrdup("");
+		toks[pend[i].tok].hdoc = pend[i].literal ? HD_LITERAL : HD_EXPAND;
+		free(pend[i].delim);
+	}
+	npend = 0;
+	return p;
+}
+
 static int lex(const char *p) {
+	int hd_next = HD_NONE; /* set when the next word is a heredoc delimiter */
+	int hd_strip = 0;
 	ntoks = ti = 0;
+	pend_reset();
 	for (;;) {
 		while (*p == ' ' || *p == '\t') p++;
 		if (*p == '\\' && p[1] == '\n') { /* line continuation */
@@ -298,12 +433,32 @@ static int lex(const char *p) {
 			continue;
 		}
 		if (!*p) {
+			/* `cat <<EOF` as the very last line: no body follows, and the
+			 * pending entry still has to be resolved or the parser would
+			 * read the delimiter itself as the body. */
+			if (npend && !(p = read_heredocs(p))) return -1;
 			tpush(TEOF, "", 0);
 			return 0;
 		}
 		if (*p == '\n') {
 			tpush(TOP, "\n", 0);
 			p++;
+			/* The body starts on the next line, so this is the only place
+			 * that can go and get it. */
+			if (npend && !(p = read_heredocs(p))) return -1;
+			continue;
+		}
+		if (!strncmp(p, "<<<", 3)) {
+			/* Fail loudly rather than lexing it as `<<` with an empty
+			 * delimiter, which would silently swallow the rest of the file. */
+			fprintf(stderr, "%s: here-strings (<<<) are not implemented\n", progname);
+			return -1;
+		}
+		if (!strncmp(p, "<<", 2)) {
+			hd_strip = p[2] == '-';
+			tpush(TOP, hd_strip ? "<<-" : "<<", 0);
+			p += hd_strip ? 3 : 2;
+			hd_next = HD_EXPAND; /* resolved for real once the body is read */
 			continue;
 		}
 		if (!strncmp(p, "&&", 2) || !strncmp(p, "||", 2) || !strncmp(p, ">>", 2) ||
@@ -392,6 +547,26 @@ static int lex(const char *p) {
 			sput(&w, c);
 			p++;
 		}
+		if (hd_next != HD_NONE) {
+			/* Always a word, never an IO_NUMBER: `cat <<2>f` opens a
+			 * here-document whose delimiter is "2", not a redirection of
+			 * fd 2. */
+			if (npend == (int)(sizeof pend / sizeof *pend)) {
+				fprintf(stderr, "%s: too many here-documents on one line\n",
+				        progname);
+				free(w.p);
+				return -1;
+			}
+			pend[npend].tok = ntoks;
+			pend[npend].delim = here_delim(w.p ? w.p : "",
+			                               &pend[npend].literal);
+			pend[npend].strip = hd_strip;
+			npend++;
+			tpush(TWORD, w.p ? w.p : "", 0);
+			free(w.p);
+			hd_next = HD_NONE;
+			continue;
+		}
 		/* "2>file": the digits are an IO_NUMBER, a token of their own, but
 		 * only when unquoted and glued to the redirection operator. */
 		int alldig = w.n > 0 && !quoted;
@@ -404,7 +579,7 @@ static int lex(const char *p) {
 
 /* --------------------------------------------------------------- parser */
 
-enum { R_IN, R_OUT, R_APPEND, R_DUP };
+enum { R_IN, R_OUT, R_APPEND, R_DUP, R_HERE, R_HERE_RAW };
 
 typedef struct {
 	int fd;
@@ -471,7 +646,8 @@ static int parse_redir(Node *n) {
 	if (cur()->type == TIONUM) {
 		fd = atoi(cur()->text);
 		adv();
-	} else if (!isop("<") && !isop(">") && !isop(">>") && !isop(">&") && !isop("<&")) {
+	} else if (!isop("<") && !isop(">") && !isop(">>") && !isop(">&") &&
+	           !isop("<&") && !isop("<<") && !isop("<<-")) {
 		return 0;
 	}
 	int how;
@@ -480,9 +656,14 @@ static int parse_redir(Node *n) {
 	else if (isop(">>")) how = R_APPEND, fd = fd < 0 ? 1 : fd;
 	else if (isop(">&")) how = R_DUP, fd = fd < 0 ? 1 : fd;
 	else if (isop("<&")) how = R_DUP, fd = fd < 0 ? 0 : fd;
+	/* `<<` and `<<-` differ only in tab stripping, which the lexer already
+	 * did, so by here they are the same redirection. */
+	else if (isop("<<") || isop("<<-")) how = R_HERE, fd = fd < 0 ? 0 : fd;
 	else return perr(cur()->text);
 	adv();
 	if (cur()->type != TWORD) return perr(cur()->text);
+	/* The token's text is the body, not the delimiter; the lexer swapped it. */
+	if (how == R_HERE && cur()->hdoc == HD_LITERAL) how = R_HERE_RAW;
 	push_redir(n, fd, how, cur()->text);
 	adv();
 	return 1;
@@ -698,6 +879,14 @@ typedef struct {
 	Str flg;
 } Exp;
 
+/*
+ * The `dq` state has three values, not two. A here-document body expands as if
+ * it were inside double quotes, with one difference the oracle is firm about:
+ * a double quote in the body is an ordinary character, and a backslash before
+ * one keeps the backslash. `cat <<EOF` on a body of `\"` prints `\"`.
+ */
+enum { DQ_NO, DQ_YES, DQ_HERE };
+
 static void expand_into(const char *raw, Exp *e, int dq);
 
 /* Set by expand_into when it consumes an actual quote character. `echo "" x`
@@ -830,9 +1019,9 @@ static void expand_into(const char *p, Exp *e, int dq_init) {
 			if (*p) p++;
 			continue;
 		}
-		if (c == '"') {
+		if (c == '"' && dq != DQ_HERE) {
 			exp_sawquote = 1;
-			dq = !dq;
+			dq = dq ? DQ_NO : DQ_YES;
 			p++;
 			continue;
 		}
@@ -843,8 +1032,10 @@ static void expand_into(const char *p, Exp *e, int dq_init) {
 				continue;
 			}
 			/* Inside double quotes a backslash is only special before
-			 * $ ` " \ and newline; elsewhere it stays literal. */
-			if (p[1] == '$' || p[1] == '`' || p[1] == '"' || p[1] == '\\') {
+			 * $ ` " \ and newline; elsewhere it stays literal. In a
+			 * here-document body the quote is not on that list. */
+			if (p[1] == '$' || p[1] == '`' || p[1] == '\\' ||
+			    (p[1] == '"' && dq != DQ_HERE)) {
 				eput(e, p[1], 1);
 				p += 2;
 			} else if (p[1] == '\n') {
@@ -965,17 +1156,17 @@ static void glob_field(const char *text, const char *flg, size_t n, Vec *out) {
 	free(pat.p);
 }
 
-enum { EX_FULL, EX_NOSPLIT };
+enum { EX_FULL, EX_NOSPLIT, EX_HEREDOC };
 
 static void expand_word(const char *raw, Vec *out, int mode) {
 	Exp e = {0};
 	exp_sawquote = 0;
-	expand_into(raw, &e, 0);
+	expand_into(raw, &e, mode == EX_HEREDOC ? DQ_HERE : DQ_NO);
 	size_t n = e.text.n;
 	const char *t = e.text.p ? e.text.p : "";
 	const char *f = e.flg.p ? e.flg.p : "";
 
-	if (mode == EX_NOSPLIT) {
+	if (mode != EX_FULL) {
 		Str s = {0};
 		for (size_t i = 0; i < n; i++) sput(&s, t[i]);
 		vpush(out, s.p ? s.p : xstrdup(""));
@@ -1267,9 +1458,80 @@ typedef struct {
 	int n;
 } FdSave;
 
+/*
+ * Turn a here-document body into a readable fd.
+ *
+ * An unlinked temporary file rather than a pipe. A pipe is what dash uses for
+ * short bodies and it is less code here, but it deadlocks the moment the body
+ * exceeds the pipe buffer unless a writer process is forked -- and the body is
+ * expanded, so its size is not known when the choice has to be made. A file
+ * costs five lines and no fork.
+ */
+static int here_fd(const char *body, int expand) {
+	const char *dir = getenv("TMPDIR");
+	char path[PATH_MAX];
+	if (!dir || !*dir) dir = "/tmp";
+	if (snprintf(path, sizeof path, "%s/psh-here-XXXXXX", dir) >= (int)sizeof path) {
+		fflush(stdout);
+		fprintf(stderr, "%s: TMPDIR is too long\n", progname);
+		return -1;
+	}
+	int fd = mkstemp(path);
+	if (fd < 0) {
+		fflush(stdout);
+		fprintf(stderr, "%s: %s: %s\n", progname, path, strerror(errno));
+		return -1;
+	}
+	unlink(path); /* the descriptor is the only handle from here on */
+
+	char *owned = NULL;
+	const char *out = body;
+	if (expand) {
+		Vec v = {0};
+		expand_word(body, &v, EX_HEREDOC);
+		out = owned = v.v[0];
+		free(v.v);
+	}
+	size_t len = strlen(out), off = 0;
+	int rc = 0;
+	while (off < len) {
+		ssize_t k = write(fd, out + off, len - off);
+		if (k < 0) {
+			if (errno == EINTR) continue;
+			fflush(stdout);
+			fprintf(stderr, "%s: here-document: %s\n", progname, strerror(errno));
+			rc = -1;
+			break;
+		}
+		off += (size_t)k;
+	}
+	free(owned);
+	if (rc < 0 || lseek(fd, 0, SEEK_SET) == (off_t)-1) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
 static int apply_redirs(Redir *r, int n, FdSave *sv) {
 	if (sv) sv->n = 0;
 	for (int i = 0; i < n; i++) {
+		/* The body is already in r[i].word; there is no filename to expand
+		 * and nothing that could be an ambiguous redirect. */
+		if (r[i].how == R_HERE || r[i].how == R_HERE_RAW) {
+			int hf = here_fd(r[i].word, r[i].how == R_HERE);
+			if (hf < 0) return -1;
+			if (sv && sv->n < 16) {
+				sv->fd[sv->n] = r[i].fd;
+				sv->saved[sv->n] = fcntl(r[i].fd, F_DUPFD_CLOEXEC, 10);
+				sv->n++;
+			}
+			if (hf != r[i].fd) {
+				dup2(hf, r[i].fd);
+				close(hf);
+			}
+			continue;
+		}
 		Vec w = {0};
 		expand_word(r[i].word, &w, EX_NOSPLIT);
 		if (w.n != 1) {
