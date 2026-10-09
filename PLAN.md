@@ -153,15 +153,30 @@ Ranked, strongest first:
       Two divergences from dash are in the README rather than fixed: a stray
       `)` in a body inside `$(...)`, and backquotes, which are refused rather
       than silently passed through as literals.
-- [ ] Shell functions, including `return` and the fact that a function body is
+- [x] Shell functions, including `return` and the fact that a function body is
       a compound command that can carry redirections.
       why: without functions a script cannot factor anything, so the corpus
       cannot grow past straight-line tests.
+      done: 22 cases, 185 -> 207. The body being a compound command meant the
+      redirection worked for free -- parse_command already attaches trailing
+      redirections to the compound, so `f() { ...; } > file` redirects per call
+      with no extra code at all. Two guesses were wrong and dash corrected
+      both: a top-level `return` ends the script rather than being a quiet
+      no-op, and the recursion cap has to be dash's 1000 rather than a number
+      of my own, because a script recursing 500 deep works there and failed
+      here at the 100 I first picked. Six mutations, five caught; the survivor
+      was the retctl break in the while loop, observable only when the loop
+      condition has a side effect, which no case had -- case 207 is that case
+      and it kills it.
 - [ ] Positional parameters: `$1`..`$9`, `$#`, `"$@"` versus `$*`, `shift`,
       `set --`.
       why: `"$@"` is the one expansion that produces a *different number of
       fields* depending only on its quoting, which no other construct does, so
       it needs the quote-flag machinery extended from bytes to field boundaries.
+      Now also the thing that makes functions useful: a function cannot take an
+      argument until this lands, so `f() { echo "$1"; }; f hi` prints a blank
+      line here and `hi` in dash. That is the largest known divergence in the
+      repo and it arrived with the previous item.
 - [ ] `set -e` semantics, exactly: which commands are exempt (conditions of
       `if`/`while`/`until`, operands of `&&`/`||`, the body of `!`), and how it
       propagates into subshells.

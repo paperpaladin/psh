@@ -40,6 +40,15 @@ static int loopctl; /* 0 none, 1 break, 2 continue */
 static int loopcnt;
 static int loopdepth; /* enclosing loops in THIS shell process */
 
+/* `return` unwinds the same way break does, but all the way out of the
+ * function rather than out of one loop, so it is a separate flag and the
+ * sequencing points below stop on either. */
+static int retctl;
+static int retval;
+static int funcdepth;
+
+static int unwinding(void) { return loopctl || retctl; }
+
 static void fatal(const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
@@ -587,7 +596,8 @@ typedef struct {
 	char *word;
 } Redir;
 
-enum { N_SIMPLE, N_SEQ, N_AND, N_OR, N_PIPE, N_NOT, N_SUBSHELL, N_GROUP, N_IF, N_WHILE, N_FOR };
+enum { N_SIMPLE, N_SEQ, N_AND, N_OR, N_PIPE, N_NOT, N_SUBSHELL, N_GROUP, N_IF, N_WHILE, N_FOR,
+       N_FUNCDEF };
 
 typedef struct Node Node;
 struct Node {
@@ -627,6 +637,27 @@ static int at_terminator(void) {
 	static const char *kw[] = {"then", "else", "elif", "fi", "do", "done", "}", NULL};
 	for (int i = 0; kw[i]; i++)
 		if (iskw(kw[i])) return 1;
+	return 0;
+}
+
+/*
+ * POSIX 2.14's special builtins. Two things depend on this list: a function may
+ * not be NAMED after one (dash refuses at parse time with "Bad function name",
+ * and so does this), and a special builtin is not shadowed by a function of the
+ * same name in the 2.9.1 search order.
+ *
+ * Most of these psh does not implement. They are listed anyway, because the
+ * rule is about the name being reserved rather than about the builtin
+ * existing, and a script that defines `eval()` here and runs under dash there
+ * should fail in both places.
+ */
+static int special_builtin(const char *name) {
+	static const char *sp[] = {
+		".", ":", "break", "continue", "eval", "exec", "exit", "export",
+		"readonly", "return", "set", "shift", "times", "trap", "unset", NULL
+	};
+	for (int i = 0; sp[i]; i++)
+		if (!strcmp(sp[i], name)) return 1;
 	return 0;
 }
 
@@ -697,7 +728,37 @@ static Node *parse_if_body(void) { /* 'if' or 'elif' already consumed */
 	return n;
 }
 
+/*
+ * `name ( )` followed by a compound command. Three tokens of lookahead,
+ * because `name` alone is an ordinary command and nothing before the `)` is
+ * enough to commit -- `name (` on its own is a syntax error either way.
+ */
+static int at_funcdef(void) {
+	if (cur()->type != TWORD || cur()->quoted) return 0;
+	if (!valid_name(cur()->text, strlen(cur()->text))) return 0;
+	if (ti + 2 >= ntoks) return 0;
+	return toks[ti + 1].type == TOP && !strcmp(toks[ti + 1].text, "(") &&
+	       toks[ti + 2].type == TOP && !strcmp(toks[ti + 2].text, ")");
+}
+
 static Node *parse_command(void) {
+	if (at_funcdef()) {
+		if (special_builtin(cur()->text)) {
+			fflush(stdout);
+			fprintf(stderr, "%s: bad function name: %s\n", progname, cur()->text);
+			return NULL;
+		}
+		Node *n = nnew(N_FUNCDEF);
+		n->var = xstrdup(cur()->text);
+		adv(); adv(); adv();              /* name ( ) */
+		while (isop("\n")) adv();         /* POSIX allows newlines here */
+		/* The body is a compound command, and parse_command has already
+		 * attached any redirections written after it -- which is what makes
+		 * `f() { echo x; } > file` apply the redirection on every call
+		 * rather than at definition time. Nothing extra to do. */
+		if (!(n->body = parse_command())) return NULL;
+		return n;
+	}
 	if (isop("(")) {
 		adv();
 		Node *n = nnew(N_SUBSHELL);
@@ -1210,6 +1271,11 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 
 /* ------------------------------------------------------------- builtins */
 
+/* Defined below, next to the execution code that uses them; `unset -f` needs
+ * them here. */
+static Node *func_find(const char *name);
+static void func_undefine(const char *name);
+
 static int b_echo(char **av) {
 	int nflag = 0, first = 1;
 	int i = 1;
@@ -1392,14 +1458,34 @@ static int b_read(char **av) {
 }
 
 static int b_unset(char **av) {
+	/* -f removes a function, -v a variable, and bare `unset x` removes the
+	 * variable if there is one and otherwise the function -- which is POSIX
+	 * and is what dash does. */
+	int i = 1, want_fn = 0, want_var = 0;
+	for (; av[i] && av[i][0] == '-' && av[i][1]; i++) {
+		if (!strcmp(av[i], "-f")) want_fn = 1;
+		else if (!strcmp(av[i], "-v")) want_var = 1;
+		else {
+			fflush(stdout);
+			fprintf(stderr, "%s: unset: %s: bad option\n", progname, av[i]);
+			return 1;
+		}
+	}
 	/* dash does not complain about unsetting something that was never set. */
-	for (int i = 1; av[i]; i++) {
+	for (; av[i]; i++) {
 		if (!valid_name(av[i], strlen(av[i]))) {
 			fflush(stdout);
 			fprintf(stderr, "%s: unset: %s: bad name\n", progname, av[i]);
 			return 1;
 		}
-		unsetvar(av[i]);
+		if (want_fn) {
+			func_undefine(av[i]);
+			continue;
+		}
+		if (!want_var && !getvar(av[i]) && func_find(av[i]))
+			func_undefine(av[i]);
+		else
+			unsetvar(av[i]);
 	}
 	return 0;
 }
@@ -1415,6 +1501,27 @@ static int b_loopctl(char **av, int which) {
 	loopctl = which;
 	loopcnt = n > loopdepth ? loopdepth : n;
 	return 0;
+}
+
+/*
+ * `return [n]` with no argument keeps the current status, which is why it is
+ * not simply `return 0`: `f() { false; return; }` must come back 1.
+ *
+ * Outside a function, in a script, it ends the script -- `return 3` at the top
+ * level exits 3 and the lines after it do not run. POSIX leaves that
+ * unspecified and I guessed it was a quiet no-op; dash exits, and dash is the
+ * oracle. There is no `.` or `source` here, so a script is the only context
+ * this can happen in.
+ */
+static int b_return(char **av) {
+	int n = av[1] ? atoi(av[1]) : status;
+	if (funcdepth == 0) {
+		fflush(NULL);
+		exit(n & 0xff);
+	}
+	retctl = 1;
+	retval = n;
+	return n;
 }
 
 static int b_break(char **av) { return b_loopctl(av, 1); }
@@ -1442,6 +1549,7 @@ static struct {
     {"cd", b_cd},     {"exit", b_exit}, {"export", b_export},
     {"read", b_read}, {"unset", b_unset},
     {"break", b_break}, {"continue", b_continue},
+    {"return", b_return},
 };
 
 static int builtin_index(const char *name) {
@@ -1629,6 +1737,44 @@ static void exec_external(char **argv) {
 
 /* Run a simple command. in_child != 0 means we are already in a forked
  * process, so builtins may run here and redirections need no restoring. */
+/*
+ * Run a function body and absorb its `return`.
+ *
+ * The body is a compound command, so exec_node applies any redirections the
+ * definition carried -- which is what makes `f() { echo x; } > file` redirect
+ * on every call rather than once at definition time.
+ *
+ * The depth cap is 1000 to match dash, which reports "Maximum function
+ * recursion depth (1000) reached" and exits 2 -- and exits rather than
+ * returning, so the script stops. Matching the number matters as much as
+ * matching the behaviour: a script that recurses 500 deep works in dash, and
+ * would have failed here under the 100 I first picked.
+ *
+ * shortcut: 1000 is dash's number, not a measured stack budget. Each level is
+ * several C frames of exec_node recursion, so the real limit is the process
+ * stack; 1000 fits inside the default 8MB with room to spare, and a smaller
+ * ulimit would segfault before reaching it.
+ */
+#define MAXFUNCDEPTH 1000
+
+static int call_func(Node *body) {
+	if (funcdepth >= MAXFUNCDEPTH) {
+		fflush(stdout);
+		fprintf(stderr, "%s: maximum function recursion depth (%d) reached\n",
+		        progname, MAXFUNCDEPTH);
+		fflush(NULL);
+		exit(2);
+	}
+	funcdepth++;
+	int st = exec_node(body);
+	if (retctl) {
+		retctl = 0;
+		st = retval;
+	}
+	funcdepth--;
+	return st;
+}
+
 static int exec_simple(Node *n, int in_child) {
 	Vec argv = {0};
 	for (int i = 0; i < n->words.n; i++) expand_word(n->words.v[i], &argv, EX_FULL);
@@ -1651,6 +1797,45 @@ static int exec_simple(Node *n, int in_child) {
 		status = 0;
 		do_assigns(n, 0);
 		return status;
+	}
+
+	/*
+	 * POSIX 2.9.1 search order: special builtins, then functions, then
+	 * regular builtins, then PATH. So a function named `true` shadows the
+	 * builtin -- dash agrees -- and one named `export` cannot exist at all,
+	 * which the parser refuses outright.
+	 *
+	 * The assignment prefix is snapshotted and restored exactly as it is for
+	 * a regular command, because that is what dash does: `v=1 f` is visible
+	 * inside f and unset afterwards.
+	 */
+	Node *fbody = special_builtin(argv.v[0]) ? NULL : func_find(argv.v[0]);
+	if (fbody && !in_child) {
+		FdSave sv = {0};
+		if (n->nredirs && apply_redirs(n->redirs, n->nredirs, &sv) < 0) {
+			restore_fds(&sv);
+			return 2;
+		}
+		Vec old = {0};
+		for (int i = 0; i < n->assigns.n; i++) {
+			char *eq = strchr(n->assigns.v[i], '=');
+			*eq = 0;
+			const char *v = getvar(n->assigns.v[i]);
+			vpush(&old, v ? xstrdup(v) : NULL);
+			*eq = '=';
+		}
+		do_assigns(n, 1);
+		int st = call_func(fbody);
+		fflush(stdout);
+		for (int i = 0; i < n->assigns.n; i++) {
+			char *eq = strchr(n->assigns.v[i], '=');
+			*eq = 0;
+			if (old.v[i]) setvar(n->assigns.v[i], old.v[i]);
+			else unsetvar(n->assigns.v[i]);
+			*eq = '=';
+		}
+		if (n->nredirs) restore_fds(&sv);
+		return st;
 	}
 
 	int bi = builtin_index(argv.v[0]);
@@ -1690,6 +1875,14 @@ static int exec_simple(Node *n, int in_child) {
 	if (in_child) {
 		if (apply_redirs(n->redirs, n->nredirs, NULL) < 0) _exit(2);
 		do_assigns(n, 1);
+		/* A function in a pipeline runs in the already-forked child, so the
+		 * fork below must not happen again -- and its `return` can only
+		 * unwind to this process's exit. */
+		if (fbody) {
+			int st = call_func(fbody);
+			fflush(NULL);
+			_exit(st);
+		}
 		if (bi >= 0) {
 			int st = builtins[bi].fn(argv.v);
 			fflush(NULL);
@@ -1778,6 +1971,51 @@ static int exec_pipeline(Node *n) {
 /* One loop level consumes one pending break/continue. Returns 1 if this loop
  * should keep iterating (a `continue` aimed at us), 0 if it must stop (a
  * `break` aimed at us, or anything aimed at an outer loop). */
+/*
+ * Defined functions.
+ *
+ * shortcut: a flat array with a linear lookup and a fixed cap of 64. The
+ * lookup runs once per command, which is fine at this size; a script with more
+ * than 64 functions wants a hash table and probably a different shell. The
+ * bodies are never freed, which matches the rest of psh -- see the note at the
+ * top of this file about parse trees.
+ */
+#define MAXFUNC 64
+static struct { char *name; Node *body; } funcs[MAXFUNC];
+static int nfuncs;
+
+static Node *func_find(const char *name) {
+	for (int i = 0; i < nfuncs; i++)
+		if (!strcmp(funcs[i].name, name)) return funcs[i].body;
+	return NULL;
+}
+
+static int func_define(const char *name, Node *body) {
+	for (int i = 0; i < nfuncs; i++) {
+		if (!strcmp(funcs[i].name, name)) {
+			funcs[i].body = body;   /* redefinition replaces */
+			return 0;
+		}
+	}
+	if (nfuncs == MAXFUNC) {
+		fflush(stdout);
+		fprintf(stderr, "%s: too many functions\n", progname);
+		return 1;
+	}
+	funcs[nfuncs].name = xstrdup(name);
+	funcs[nfuncs].body = body;
+	nfuncs++;
+	return 0;
+}
+
+static void func_undefine(const char *name) {
+	for (int i = 0; i < nfuncs; i++)
+		if (!strcmp(funcs[i].name, name)) {
+			funcs[i] = funcs[--nfuncs];
+			return;
+		}
+}
+
 static int loop_absorb(void) {
 	if (--loopcnt > 0) return 0; /* still unwinding towards an outer loop */
 	int which = loopctl;
@@ -1820,9 +2058,12 @@ static int exec_compound_body(Node *n) {
 		for (;;) {
 			int c = exec_node(n->cond);
 			status = c;
-			if (loopctl) break;
+			if (unwinding()) break;
 			if (invert ? (c == 0) : (c != 0)) break;
 			st = exec_node(n->body);
+			/* `return` leaves the loop without being absorbed by it: it is
+			 * unwinding past the loop, not out of it. */
+			if (retctl) break;
 			if (loopctl && !loop_absorb()) break;
 		}
 		loopdepth--;
@@ -1836,6 +2077,7 @@ static int exec_compound_body(Node *n) {
 		for (int i = 0; i < items.n; i++) {
 			setvar(n->var, items.v[i]);
 			st = exec_node(n->body);
+			if (retctl) break;
 			if (loopctl && !loop_absorb()) break;
 		}
 		loopdepth--;
@@ -1851,19 +2093,19 @@ static int exec_node(Node *n) {
 	case N_SEQ: {
 		if (!n->left && !n->right) return status; /* empty program */
 		int s = exec_node(n->left);
-		if (loopctl) return s; /* break/continue aborts the rest of the list */
+		if (unwinding()) return s; /* break, continue or return ends the list */
 		return exec_node(n->right);
 	}
 	case N_AND: {
 		int s = exec_node(n->left);
 		status = s;
-		if (loopctl) return s;
+		if (unwinding()) return s;
 		return s == 0 ? exec_node(n->right) : s;
 	}
 	case N_OR: {
 		int s = exec_node(n->left);
 		status = s;
-		if (loopctl) return s;
+		if (unwinding()) return s;
 		return s != 0 ? exec_node(n->right) : s;
 	}
 	case N_NOT: {
@@ -1874,6 +2116,9 @@ static int exec_node(Node *n) {
 		return status = exec_pipeline(n);
 	case N_SIMPLE:
 		return status = exec_simple(n, 0);
+	case N_FUNCDEF:
+		/* Defining a function is successful and runs nothing. */
+		return status = func_define(n->var, n->body);
 	default: {
 		/* A compound command may carry its own redirections
 		 * (`while ...; done > f`); apply them around the whole body. */
