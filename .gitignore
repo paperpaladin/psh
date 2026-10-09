@@ -1,3 +1,6 @@
 psh
 psh-asan
 *.o
+
+# leaked by a redirection test once; the suite does not need it
+out.txt
