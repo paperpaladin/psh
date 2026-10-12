@@ -70,8 +70,10 @@ done
 # dash gives "xx". psh fails loudly for $((...)) for precisely this reason
 # and the comment there says so. Nothing in the corpus used either form,
 # which is how 207 of 207 agreement sat on top of it.
+EXPANSION_REFUSALS=0
 for form in 'n=xxx; echo "${n#x}"' 'n=xxx; echo "${n%x}"' \
             'echo "${n:=d}"' 'echo "${n:?w}"'; do
+	EXPANSION_REFUSALS=$((EXPANSION_REFUSALS + 1))
 	echo "$form" > "$out/exp.sh"
 	( cd "$work" && "$psh" "$out/exp.sh" ) >"$out/e.out" 2>"$out/e.err"
 	if grep -q 'unsupported expansion' "$out/e.err"; then
@@ -84,7 +86,6 @@ for form in 'n=xxx; echo "${n#x}"' 'n=xxx; echo "${n%x}"' \
 		echo "  --- stderr ---"; sed 's/^/  /' "$out/e.err"
 	fi
 done
-EXPANSION_REFUSALS=4
 
 echo "$agree agree, $disagree disagree, $skipped skipped"
 
