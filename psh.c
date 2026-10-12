@@ -1020,8 +1020,19 @@ static void expand_braced(const char *b, Exp *e, int dq) {
 		eputs(e, num, dq);
 		return;
 	}
+	/* The name ends at the operator. '#' and '%' are operators too, and
+	 * leaving them out of this list meant ${n#x} scanned "n#x" as the
+	 * whole variable name: unset, so it expanded to empty with no
+	 * diagnostic at all, where dash gives "xx". Same silent-wrong-answer
+	 * shape as the $((...)) case above, which fails loudly for exactly
+	 * this reason, so these now reach the "unsupported expansion"
+	 * diagnostic instead. ${VAR#pat} and ${VAR%pat} are PLAN item 201.
+	 *
+	 * nlen > 0 is what keeps ${#} working: there the '#' *is* the name,
+	 * and ${#NAME} has already been handled above. */
 	size_t nlen = 0;
-	while (b[nlen] && b[nlen] != ':' && b[nlen] != '-' && b[nlen] != '+') nlen++;
+	while (b[nlen] && b[nlen] != ':' && b[nlen] != '-' && b[nlen] != '+'
+	       && !(nlen > 0 && (b[nlen] == '#' || b[nlen] == '%'))) nlen++;
 	char *name = xmalloc(nlen + 1);
 	memcpy(name, b, nlen);
 	name[nlen] = 0;
