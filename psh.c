@@ -1027,6 +1027,17 @@ static void emark(Exp *e, int kind) {
 	sput(&e->flg, kind);
 }
 
+/* Append one expansion to another, flag bytes verbatim. eput() normalises its
+ * flag to 0 or 1, which silently flattened the $@ marks when a sub-expansion
+ * was copied back: `set -- "a b" "c d"; f ${u:-"$@"}` passed one argument
+ * here and two in dash. */
+static void eappend(Exp *e, const Exp *sub) {
+	for (size_t i = 0; i < sub->text.n; i++) {
+		sput(&e->text, sub->text.p[i]);
+		sput(&e->flg, sub->flg.p[i]);
+	}
+}
+
 /*
  * $@ and $*. Three behaviours, not two:
  *
@@ -1153,7 +1164,7 @@ static void expand_braced(const char *b, Exp *e, int dq) {
 			Exp sub = {0};
 			/* The default word is itself expanded, recursively. */
 			expand_into(op + 1, &sub, dq);
-			for (size_t i = 0; i < sub.text.n; i++) eput(e, sub.text.p[i], sub.flg.p[i]);
+			eappend(e, &sub);
 		} else {
 			eputs(e, v, dq);
 		}
@@ -1161,7 +1172,7 @@ static void expand_braced(const char *b, Exp *e, int dq) {
 		if (!unset) {
 			Exp sub = {0};
 			expand_into(op + 1, &sub, dq);
-			for (size_t i = 0; i < sub.text.n; i++) eput(e, sub.text.p[i], sub.flg.p[i]);
+			eappend(e, &sub);
 		}
 	} else if (!*op) {
 		if (v) eputs(e, v, dq);

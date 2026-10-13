@@ -180,8 +180,8 @@ Ranked, strongest first:
       argument until this lands, so `f() { echo "$1"; }; f hi` prints a blank
       line here and `hi` in dash. That is the largest known divergence in the
       repo and it arrived with the previous item.
-      done: 34 cases, 208 -> 242, plus four more refusal checks for the `set`
-      options, 212 -> 250 verdicts. The field boundary rides in the quote-flag
+      done: 35 cases, 208 -> 243, plus four more refusal checks for the `set`
+      options, 212 -> 251 verdicts. The field boundary rides in the quote-flag
       array that already existed: flag 2 is a break from a quoted `"$@"` where
       an empty field is a real empty argument, flag 3 a break from the
       unquoted forms where it is nothing. Four guesses were wrong and dash
@@ -198,7 +198,12 @@ Ranked, strongest first:
       and a canary check, because a sidecar that is never read leaves both
       shells with zero arguments and in perfect agreement: the first version
       of that check compared two fresh dash runs and survived deleting the
-      sidecar read from the loop. 26 mutations, 26 caught, no survivors.
+      sidecar read from the loop. 27 mutations, 27 caught, no survivors.
+      One bug outlived the first green run: `${u:-"$@"}` collapsed two
+      parameters into one argument, because the loop copying a sub-expansion
+      back into the outer one went through eput(), which normalises the flag
+      byte to 0 or 1 and so erased the field marks. Case 243 is that, and the
+      27th mutation is the old loop put back.
 - [ ] `set -e` semantics, exactly: which commands are exempt (conditions of
       `if`/`while`/`until`, operands of `&&`/`||`, the body of `!`), and how it
       propagates into subshells.
