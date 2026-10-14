@@ -64,7 +64,7 @@ Ranked, strongest first:
 - Shell functions (`name() { ... }`).
 - Here-strings (`<<<`). psh refuses them loudly. Dash has none either.
 - `trap`, `set -e`/`set -u`/`set -x`/`set --`, `shift`, positional parameters
-  and `$@`/`$*`/`$1` (they expand to empty, which is what dash does when a
+  and `$@`/`$*`/`$1` (they expand to empty, as dash does when a
   script is given no arguments).
 - Arithmetic expansion `$(( ))`. psh refuses it loudly instead of silently
   mis-evaluating it.
@@ -113,10 +113,10 @@ Ranked, strongest first:
       why: dash's `echo` interprets backslash escapes with no `-e` and consumes
       exactly one `-n`. Copying bash here would have made psh fail its own oracle.
 - [x] Builtins `cd` (incl. `cd -`), `exit`, `export`, `unset`, `read`.
-      why: these change the shell's own state, which is what forces the
+      why: these change the shell's own state, and that is what forces the
       parent-vs-child builtin split; and `read` must not buffer past the newline.
 - [x] `if`/`elif`/`else`/`fi`.
-      why: an `if` with no taken branch is successful, which is the rule that
+      why: an `if` with no taken branch is successful, the rule that
       makes conditionals safe, and parsing `elif` as a nested `if` with a single
       shared `fi` is the detail every first attempt gets wrong.
 - [x] `while`/`until`, `break [n]`, `continue [n]`.
