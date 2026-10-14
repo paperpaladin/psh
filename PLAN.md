@@ -46,7 +46,7 @@ Ranked, strongest first:
 1. dash (`/bin/dash`), run on the same script in the same scratch directory
    path, compared on stdout and exit status. This is the authority. If dash and
    psh disagree, psh is wrong by definition. If dash *rejects* a script
-   (syntax error, exit 2), the case is skipped, not scored: an oracle
+   (syntax error, exit 2), the case is skipped, not scored. An oracle
    that will not run the program cannot rule on it.
 2. ASAN + UBSAN over the whole corpus (`make test-asan`). Memory errors in
    the expansion buffers and the parallel quote-flag arrays are exactly the
@@ -62,7 +62,7 @@ Ranked, strongest first:
 - Job control: no `&`, no `jobs`/`fg`/`bg`, no process groups, no terminal
   ownership handoff. `&` is a syntax error.
 - Shell functions (`name() { ... }`).
-- Here-strings (`<<<`). psh refuses them loudly. Dash has none either.
+- Here-strings (`<<<`). psh refuses them loudly. dash has none either.
 - `trap`, `set -e`/`set -u`/`set -x`/`set --`, `shift`, positional parameters
   and `$@`/`$*`/`$1` (they expand to empty, as dash does when a
   script is given no arguments).
