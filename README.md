@@ -155,17 +155,14 @@ Honest list. None of these are "coming soon". They are absent today.
 - No job control. `&` is a syntax error. No `jobs`, `fg`, `bg`, `wait`, no
   process groups, no terminal ownership. The shell ignores `SIGINT` outright, so
   Ctrl-C will not interrupt a loop, it only reaches the foreground child.
-- No here-strings. `<<<` is refused with a diagnostic, not lexed as
-  `<<` with an empty delimiter, which would silently swallow the rest of the
+- No here-strings. `<<<` is refused with a diagnostic instead of being lexed as `<<` with an empty delimiter, which would silently swallow the rest of the
   file. dash has no `<<<` either.
 - A here-document inside `$(...)` breaks on an unbalanced `)` in the body.
   `v=$(cat <<EOF` / `has ) paren` / `EOF` / `)` works in dash and is a syntax
   error in psh, because the scanner that copies a `$(...)` construct verbatim
   counts parentheses and tracks quoting but knows nothing about here-document
   bodies, so the stray `)` ends the copy early. The leftover text goes to the
-  outer parser, so both shapes tried so far come out as a syntax
-  error and exit 2, not as a wrong string, but that is an observation
-  about those two, not a guarantee about every body.
+  outer parser, so both shapes tried so far come out as a syntax error and exit 2 instead of a wrong string, but that is an observation about those two and no guarantee about every body.
 - Backquotes in a here-document body are refused, not substituted. dash
   expands `` ` `` there. psh rejects a backquote everywhere else, and an
   expanding body is the one place where passing one through as a literal would
@@ -174,7 +171,7 @@ Honest list. None of these are "coming soon". They are absent today.
   left alone.
 - No `trap`.
 - No `set`. No `set -e`, `-u`, `-x`, and no `set --`.
-- `${VAR#pat}` and `${VAR%pat}` are refused, not silently empty. They are
+- `${VAR#pat}` and `${VAR%pat}` are refused, and neither quietly expands to nothing. They are
   not implemented (PLAN item 201), and until recently the name scan in
   `expand_brace` stopped only at `:`, `-` and `+`, so `${n#x}` was read as a
   variable *named* `n#x`, found unset, and expanded to nothing while dash
@@ -190,8 +187,7 @@ Honest list. None of these are "coming soon". They are absent today.
   exactly that reason: functions came first because the plan said so, and the
   pairing is what makes either worth having.
 - No local variables. POSIX has none and dash's `local` is an extension, so
-  a function that sets a variable changes the caller's. Asserted,
-  not merely absent: `191-function-globals.sh` compares that against dash.
+  a function that sets a variable changes the caller's. Asserted explicitly: `191-function-globals.sh` compares that against dash.
 - `break` inside a function can reach the caller's loops. `loopdepth` is
   per-process and is not saved across a call, so `f() { break; }` called from
   inside a loop breaks that loop. dash has the same wart, so the corpus cannot
