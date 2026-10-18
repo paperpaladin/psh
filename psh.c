@@ -110,6 +110,25 @@ static void vpush(Vec *a, char *s) {
 	a->v[a->n] = NULL;
 }
 
+/* ------------------------------------------------- positional parameters */
+
+/*
+ * args.v[0] is $1 and args.n is $#. $0 is held apart from the vector because
+ * neither `set --` nor `shift` touches it, and because a function call
+ * replaces the vector while leaving $0 alone, which is what dash does.
+ */
+static Vec args;
+static const char *arg0 = "psh";
+
+/* Replace the whole vector. The old strings are not freed: psh leaks by
+ * design (see the note at the top), and `set -- "$@"` would otherwise free
+ * the strings it is still reading from. */
+static void args_set(char **av) {
+	args.n = 0;
+	for (int i = 0; av[i]; i++) vpush(&args, xstrdup(av[i]));
+	if (args.v) args.v[args.n] = NULL;
+}
+
 /* ------------------------------------------------------------- variables */
 typedef struct Var {
 	struct Var *next;
@@ -130,6 +149,23 @@ static Var *vfind(const char *name) {
 static const char *getvar(const char *name) {
 	Var *v = vfind(name);
 	return v ? v->val : NULL;
+}
+
+/*
+ * Look up what `$NAME` / `${NAME}` names. An all-digit name is a positional
+ * parameter, not a variable: this is the whole of the ${10} versus $10
+ * distinction, because the lexer hands ${10} the two-character name "10"
+ * while $10 is scanned as $1 followed by a literal '0'.
+ */
+static const char *param_get(const char *name) {
+	for (const char *s = name; ; s++) {
+		if (!*s) break;
+		if (!isdigit((unsigned char)*s)) return getvar(name);
+	}
+	if (!*name) return getvar(name);
+	long i = strtol(name, NULL, 10);
+	if (i == 0) return arg0;
+	return (i >= 1 && i <= args.n) ? args.v[i - 1] : NULL;
 }
 
 static void setvar(const char *name, const char *val) {
@@ -959,6 +995,11 @@ static void expand_into(const char *raw, Exp *e, int dq);
  * itself (command substitution forks). */
 static int exp_sawquote;
 
+static const char *ifs_value(void) {
+	const char *v = getvar("IFS");
+	return v ? v : " \t\n";
+}
+
 static void eput(Exp *e, int c, int quoted) {
 	sput(&e->text, c);
 	sput(&e->flg, quoted ? 1 : 0);
@@ -966,6 +1007,52 @@ static void eput(Exp *e, int c, int quoted) {
 
 static void eputs(Exp *e, const char *s, int quoted) {
 	while (*s) eput(e, *s++, quoted);
+}
+
+/*
+ * A field boundary carried through the expansion buffer.
+ *
+ * "$@" is the only expansion whose *number of fields* depends on nothing but
+ * its quoting, so the boundaries between parameters have to survive step 1
+ * and be honoured by step 2 even where IFS would not split. The quote-flag
+ * array already exists per byte, so the boundary rides in it: flag 2 means
+ * "break here, and an empty field on either side is a real empty argument"
+ * (quoted "$@"), flag 3 means "break here, but an empty field is nothing"
+ * (unquoted $@ and $*). The text byte under a mark is never used.
+ */
+enum { FLG_BREAK_Q = 2, FLG_BREAK_U = 3 };
+
+static void emark(Exp *e, int kind) {
+	sput(&e->text, ' ');
+	sput(&e->flg, kind);
+}
+
+/*
+ * $@ and $*. Three behaviours, not two:
+ *
+ *   "$*"  joins the parameters with the first byte of IFS, here and now, and
+ *         the result is one quoted field.
+ *   "$@"  one field per parameter, whatever IFS says.
+ *   $@    and unquoted $*, which dash treats identically: one field per
+ *         parameter, each then subject to ordinary IFS splitting, and an
+ *         empty parameter contributes no field at all. POSIX describes
+ *         unquoted $* as a join-then-split, and that is observably not what
+ *         dash does: with IFS=: and the parameters a "" b, a join would give
+ *         the three fields a, "" and b, and dash gives two.
+ */
+static void expand_params(Exp *e, int at, int dq) {
+	if (!at && dq) {
+		const char *ifs = ifs_value();
+		for (int i = 0; i < args.n; i++) {
+			if (i && *ifs) eput(e, *ifs, 1);
+			eputs(e, args.v[i], 1);
+		}
+		return;
+	}
+	for (int i = 0; i < args.n; i++) {
+		if (i) emark(e, dq ? FLG_BREAK_Q : FLG_BREAK_U);
+		eputs(e, args.v[i], dq);
+	}
 }
 
 /* Run `cmd` in a child, capture its stdout, strip trailing newlines. */
@@ -1003,8 +1090,28 @@ static char *command_subst(const char *cmd) {
 
 /* Handle one ${...} body (without the braces). */
 static void expand_braced(const char *b, Exp *e, int dq) {
-	if (!strcmp(b, "#")) { /* ${#} is $#, not a length */
-		eputs(e, "0", dq);
+	if (!strcmp(b, "#")) { /* ${#} is $#, not the length of a variable "#" */
+		char num[16];
+		snprintf(num, sizeof num, "%d", args.n);
+		eputs(e, num, dq);
+		return;
+	}
+	if (!strcmp(b, "@") || !strcmp(b, "*")) {
+		expand_params(e, b[0] == '@', dq);
+		return;
+	}
+	/* ${#*} and ${#@} are both the length of "$*", not the count: with the
+	 * parameters a b c dash prints 5, not 3. Easy to get wrong in the silent
+	 * direction, because the old name scan read "#*" as a variable name,
+	 * found it unset and printed 0. */
+	if (!strcmp(b, "#*") || !strcmp(b, "#@")) {
+		Exp sub = {0};
+		expand_params(&sub, 0, DQ_YES);
+		char num[32];
+		snprintf(num, sizeof num, "%zu", sub.text.n);
+		eputs(e, num, dq);
+		free(sub.text.p);
+		free(sub.flg.p);
 		return;
 	}
 	if (!strcmp(b, "?")) {
@@ -1014,7 +1121,7 @@ static void expand_braced(const char *b, Exp *e, int dq) {
 		return;
 	}
 	if (*b == '#' && b[1]) { /* ${#NAME} -> length */
-		const char *v = getvar(b + 1);
+		const char *v = param_get(b + 1);
 		char num[32];
 		snprintf(num, sizeof num, "%zu", v ? strlen(v) : (size_t)0);
 		eputs(e, num, dq);
@@ -1036,7 +1143,7 @@ static void expand_braced(const char *b, Exp *e, int dq) {
 	char *name = xmalloc(nlen + 1);
 	memcpy(name, b, nlen);
 	name[nlen] = 0;
-	const char *v = getvar(name);
+	const char *v = param_get(name);
 	const char *op = b + nlen;
 	int colon = *op == ':';
 	if (colon) op++;
@@ -1091,6 +1198,37 @@ static void expand_into(const char *p, Exp *e, int dq_init) {
 			if (*p) p++;
 			continue;
 		}
+		/*
+		 * `"$@"` as a whole, before the quote is treated as an ordinary
+		 * quote. With no parameters it must leave NO field, where a quoted
+		 * empty string leaves one: `set --; f "$@"` passes zero arguments
+		 * and `set --; f ""` passes one. The only thing separating them
+		 * after expansion is exp_sawquote, so these quotes must not set it.
+		 * With at least one parameter they must, or `set -- ""; f "$@"`
+		 * would pass zero where dash passes one.
+		 *
+		 * Scoped to the exact spelling on purpose. dash agrees that the
+		 * cancellation does not travel: `set --; f ""$@` passes one empty
+		 * argument, because there the quotes are not the ones around $@.
+		 *
+		 * shortcut: matched as two literal spellings rather than tracked
+		 * through the expansion. Ceiling: a quoted $@ reached by any other
+		 * route, `"${1+"$@"}"` for instance, would leave an empty argument
+		 * behind where dash leaves none. Upgrade path: a per-field "this
+		 * came from a parameter that had none" flag alongside the field
+		 * marks, set by expand_params and cleared by any other byte.
+		 */
+		if (c == '"' && !dq) {
+			size_t k = 0;
+			if (!strncmp(p, "\"$@\"", 4)) k = 4;
+			else if (!strncmp(p, "\"${@}\"", 6)) k = 6;
+			if (k) {
+				if (args.n) exp_sawquote = 1;
+				expand_params(e, 1, DQ_YES);
+				p += k;
+				continue;
+			}
+		}
 		if (c == '"' && dq != DQ_HERE) {
 			exp_sawquote = 1;
 			dq = dq ? DQ_NO : DQ_YES;
@@ -1127,12 +1265,24 @@ static void expand_into(const char *p, Exp *e, int dq_init) {
 				p += 2;
 				continue;
 			}
-			if (n == '#') { /* no positional parameters -> always 0 */
-				eputs(e, "0", dq);
+			if (n == '#') {
+				char num[16];
+				snprintf(num, sizeof num, "%d", args.n);
+				eputs(e, num, dq);
 				p += 2;
 				continue;
 			}
-			if (isdigit((unsigned char)n)) { /* $1.. unset -> empty, as in dash */
+			if (n == '@' || n == '*') {
+				expand_params(e, n == '@', dq);
+				p += 2;
+				continue;
+			}
+			/* One digit only: $10 is $1 followed by a literal '0'. The
+			 * two-digit form is ${10} and goes through expand_braced. */
+			if (isdigit((unsigned char)n)) {
+				char name[2] = { n, 0 };
+				const char *v = param_get(name);
+				if (v) eputs(e, v, dq);
 				p += 2;
 				continue;
 			}
@@ -1190,11 +1340,6 @@ static void expand_into(const char *p, Exp *e, int dq_init) {
 	}
 }
 
-static const char *ifs_value(void) {
-	const char *v = getvar("IFS");
-	return v ? v : " \t\n";
-}
-
 /* Step 3: glob a single field. Quoted metacharacters are backslash-escaped so
  * glob(3) treats them literally; glob(3) honours backslash unless
  * GLOB_NOESCAPE. No match -> the field is used as written (POSIX). */
@@ -1228,6 +1373,30 @@ static void glob_field(const char *text, const char *flg, size_t n, Vec *out) {
 	free(pat.p);
 }
 
+/* Step 2 proper, over one stretch of buffer with no $@ marks in it. IFS
+ * whitespace runs collapse and leading or trailing runs produce no empty
+ * fields; a non-whitespace IFS byte is a hard delimiter. Only unquoted bytes
+ * delimit. An empty stretch yields a field only if `qempty`. */
+static void split_piece(const char *t, const char *f, size_t n,
+                        const char *ifs, int qempty, Vec *out) {
+	if (n == 0) {
+		if (qempty) vpush(out, xstrdup(""));
+		return;
+	}
+	size_t i = 0;
+	while (i < n) {
+		while (i < n && !f[i] && strchr(ifs, t[i]) && isspace((unsigned char)t[i])) i++;
+		if (i >= n) break;
+		size_t start = i;
+		while (i < n && !(!f[i] && strchr(ifs, t[i]))) i++;
+		glob_field(t + start, f + start, i - start, out);
+		if (i < n && !f[i] && !isspace((unsigned char)t[i])) {
+			i++; /* consume the hard delimiter; an empty field may follow */
+			if (i == n) vpush(out, xstrdup(""));
+		}
+	}
+}
+
 enum { EX_FULL, EX_NOSPLIT, EX_HEREDOC };
 
 static void expand_word(const char *raw, Vec *out, int mode) {
@@ -1239,8 +1408,18 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 	const char *f = e.flg.p ? e.flg.p : "";
 
 	if (mode != EX_FULL) {
+		/* No splitting here, so a $@ boundary becomes the join character
+		 * instead: dash gives `IFS=:; set -- a b c; x=$@` the value a:b:c,
+		 * and an empty IFS joins with nothing. */
+		const char *ifs = ifs_value();
 		Str s = {0};
-		for (size_t i = 0; i < n; i++) sput(&s, t[i]);
+		for (size_t i = 0; i < n; i++) {
+			if (f[i] >= FLG_BREAK_Q) {
+				if (*ifs) sput(&s, *ifs);
+			} else {
+				sput(&s, t[i]);
+			}
+		}
 		vpush(out, s.p ? s.p : xstrdup(""));
 		free(e.text.p);
 		free(e.flg.p);
@@ -1256,26 +1435,20 @@ static void expand_word(const char *raw, Vec *out, int mode) {
 		free(e.flg.p);
 		return;
 	}
+	/* The buffer is cut at the $@ marks first, and each piece is split on
+	 * IFS independently. A piece that is empty is an argument only when one
+	 * of the marks bounding it came from a quoted "$@": `set -- a "" b` then
+	 * `f "$@"` passes three arguments and `f $@` passes two. */
 	const char *ifs = ifs_value();
-	size_t i = 0;
-	int any = 0;
-	while (i < n) {
-		while (i < n && !f[i] && strchr(ifs, t[i]) && isspace((unsigned char)t[i])) i++;
-		if (i >= n) break;
-		size_t start = i;
-		while (i < n && !(!f[i] && strchr(ifs, t[i]))) i++;
-		glob_field(t + start, f + start, i - start, out);
-		any = 1;
-		if (i < n && !f[i] && !isspace((unsigned char)t[i])) {
-			i++; /* consume the hard delimiter; an empty field may follow */
-			if (i == n) {
-				vpush(out, xstrdup(""));
-			}
-		}
+	size_t seg = 0;
+	int openq = 0;
+	for (size_t i = 0; i <= n; i++) {
+		if (i < n && f[i] < FLG_BREAK_Q) continue;
+		int closeq = i < n && f[i] == FLG_BREAK_Q;
+		split_piece(t + seg, f + seg, i - seg, ifs, openq || closeq, out);
+		seg = i + 1;
+		openq = closeq;
 	}
-	/* A word that expands to nothing at all contributes no field -- this is
-	 * why `cmd $unset` runs cmd with zero arguments, not with "". */
-	(void)any;
 	free(e.text.p);
 	free(e.flg.p);
 }
@@ -1538,6 +1711,59 @@ static int b_return(char **av) {
 static int b_break(char **av) { return b_loopctl(av, 1); }
 static int b_continue(char **av) { return b_loopctl(av, 2); }
 
+/*
+ * `set`. Only the positional-parameter half: `set -- a b c`, `set --` to
+ * clear, and the operand form `set a b` that dash also accepts.
+ *
+ * Anything that looks like an option is refused with a diagnostic rather than
+ * ignored. `set -e` silently doing nothing is the worst available outcome: the
+ * script keeps running past the failure it asked to abort on, and nothing says
+ * so. Bare `set` lists every variable in dash, which is a different feature.
+ */
+static int b_set(char **av) {
+	char **p = av + 1;
+	if (!*p) {
+		fflush(stdout);
+		fprintf(stderr, "%s: set: listing variables is unsupported\n", progname);
+		return 2;
+	}
+	if (!strcmp(*p, "--")) {
+		p++;
+	} else if (**p == '-' || **p == '+') {
+		fflush(stdout);
+		fprintf(stderr, "%s: set %s: unsupported option\n", progname, *p);
+		return 2;
+	}
+	args_set(p);
+	return 0;
+}
+
+/*
+ * `shift`. Shifting further than $# is not a status-1 failure: dash prints
+ * "can't shift that many" and the script STOPS, because shift is one of
+ * POSIX 2.14's special builtins and an error in one of those ends a
+ * non-interactive shell. Guessed wrong first time; the oracle said exit 2
+ * with the rest of the script unrun.
+ */
+static int b_shift(char **av) {
+	long k = 1;
+	if (av[1]) {
+		char *end;
+		k = strtol(av[1], &end, 10);
+		if (end == av[1] || *end) k = -1;
+	}
+	if (k < 0 || k > args.n) {
+		fflush(stdout);
+		fprintf(stderr, "%s: shift: can't shift that many\n", progname);
+		fflush(NULL);
+		exit(2);
+	}
+	for (int i = 0; (long)i + k < args.n; i++) args.v[i] = args.v[i + k];
+	args.n -= (int)k;
+	if (args.v) args.v[args.n] = NULL;
+	return 0;
+}
+
 static int b_true(char **av) {
 	(void)av;
 	return 0;
@@ -1561,6 +1787,7 @@ static struct {
     {"read", b_read}, {"unset", b_unset},
     {"break", b_break}, {"continue", b_continue},
     {"return", b_return},
+    {"set", b_set},   {"shift", b_shift},
 };
 
 static int builtin_index(const char *name) {
@@ -1768,7 +1995,7 @@ static void exec_external(char **argv) {
  */
 #define MAXFUNCDEPTH 1000
 
-static int call_func(Node *body) {
+static int call_func(Node *body, char **argv) {
 	if (funcdepth >= MAXFUNCDEPTH) {
 		fflush(stdout);
 		fprintf(stderr, "%s: maximum function recursion depth (%d) reached\n",
@@ -1777,11 +2004,18 @@ static int call_func(Node *body) {
 		exit(2);
 	}
 	funcdepth++;
+	/* A call replaces $1.. and $# for the duration and restores them on
+	 * return, so `shift` inside a function shifts the function's arguments.
+	 * $0 is deliberately untouched: dash keeps the script name there. */
+	Vec saved = args;
+	args = (Vec){0};
+	args_set(argv + 1);
 	int st = exec_node(body);
 	if (retctl) {
 		retctl = 0;
 		st = retval;
 	}
+	args = saved;
 	funcdepth--;
 	return st;
 }
@@ -1836,7 +2070,7 @@ static int exec_simple(Node *n, int in_child) {
 			*eq = '=';
 		}
 		do_assigns(n, 1);
-		int st = call_func(fbody);
+		int st = call_func(fbody, argv.v);
 		fflush(stdout);
 		for (int i = 0; i < n->assigns.n; i++) {
 			char *eq = strchr(n->assigns.v[i], '=');
@@ -1890,7 +2124,7 @@ static int exec_simple(Node *n, int in_child) {
 		 * fork below must not happen again -- and its `return` can only
 		 * unwind to this process's exit. */
 		if (fbody) {
-			int st = call_func(fbody);
+			int st = call_func(fbody, argv.v);
 			fflush(NULL);
 			_exit(st);
 		}
@@ -2193,9 +2427,15 @@ int main(int argc, char **argv) {
 	                          * session does not interrupt a loop. Upgrade
 	                          * path: process groups + tcsetpgrp. */
 
+	/* $0 and $1.. come from the command line. For a script it is the path as
+	 * given, which is what dash reports and what makes the oracle able to
+	 * compare `echo $0` at all; for -c it is the following operand if there
+	 * is one, else the shell's own argv[0], again as dash does. */
 	char *text = NULL;
 	if (argc >= 3 && !strcmp(argv[1], "-c")) {
 		text = xstrdup(argv[2]);
+		arg0 = argc > 3 ? argv[3] : argv[0];
+		args_set(argv + (argc > 3 ? 4 : argc));
 	} else if (argc >= 2 && strcmp(argv[1], "-") != 0) {
 		FILE *f = fopen(argv[1], "r");
 		if (!f) {
@@ -2204,7 +2444,11 @@ int main(int argc, char **argv) {
 		}
 		text = slurp(f);
 		fclose(f);
+		arg0 = argv[1];
+		args_set(argv + 2);
 	} else {
+		arg0 = argv[0];
+		args_set(argv + (argc >= 2 ? 2 : argc));
 		text = slurp(stdin);
 	}
 
