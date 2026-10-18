@@ -118,7 +118,7 @@ echo "$agree agree, $disagree disagree, $skipped skipped"
 # pinned rather than floored for the same reason as wasmi's: a floor only
 # catches an empty directory, and this number is the "208 agree" that INDEX.md
 # quotes. When a case is added deliberately, this moves in the same commit.
-CASES_EXPECTED=242
+CASES_EXPECTED=243
 MAX_SKIPPED=10
 
 cases=$(ls "$here"/cases/*.sh 2>/dev/null | wc -l)

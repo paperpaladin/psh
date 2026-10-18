@@ -9,7 +9,7 @@ A POSIX shell subset in one C file, kept honest by differential testing against
 $ make test
 gcc -std=c11 -Wall -Wextra -O2 -o psh psh.c
 ./t/run.sh
-250 agree, 0 disagree, 0 skipped
+251 agree, 0 disagree, 0 skipped
 ```
 
 ```
@@ -17,7 +17,7 @@ $ make test-asan
 gcc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
 	-fno-omit-frame-pointer -o psh-asan psh.c
 ASAN_OPTIONS=detect_leaks=0 PSH=./psh-asan ./t/run.sh
-250 agree, 0 disagree, 0 skipped
+251 agree, 0 disagree, 0 skipped
 ```
 
 Run a script or a string:
@@ -44,7 +44,7 @@ So psh is organised around that question. There is no spec-reading step and no
 `t/cases/` compares psh's output against dash's, and every corner that psh
 skips is skipped on purpose, named below, and not quietly papered over.
 
-The interesting artefact is therefore not the shell. It is the 242-script
+The interesting artefact is therefore not the shell. It is the 243-script
 corpus, plus eight checks that psh refuses the expansions and the `set`
 options it has not implemented, and the fact that the number on the last line
 of `make test` is a real measurement, not a self-assessment. The corpus size
