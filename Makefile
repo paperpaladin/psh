@@ -15,8 +15,14 @@ test: psh
 # LeakSanitizer would report hundreds of by-design leaks and bury the real
 # findings. ASAN/UBSAN still catch the bugs that matter here -- overruns in the
 # expansion buffers and bad arithmetic on the quote-flag arrays.
+#
+# halt_on_error=1 because UBSAN's default is to print and carry on with exit 0,
+# and this harness compares stdout and exit status only. A planted read one
+# past FdSave's int fd[16] was reported by UBSAN and the suite stayed green;
+# see the README section on what the sanitizers can and cannot see.
 test-asan: psh-asan
-	ASAN_OPTIONS=detect_leaks=0 PSH=./psh-asan ./t/run.sh
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+		PSH=./psh-asan ./t/run.sh
 
 psh-asan: psh.c
 	$(CC) -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \

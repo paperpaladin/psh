@@ -14,8 +14,9 @@ assignment, `$VAR`, `${VAR}`, `${VAR:-w}`, `${VAR:+w}`, `${#VAR}`, `$?`;
 pathname expansion through `glob(3)`; command substitution `$(...)`;
 positional parameters `$0`, `$1`..`$9`, `${10}`, `$#`, `"$@"` and `$*`; the
 builtins `cd`, `exit`, `export`, `echo`, `true`, `false`, `pwd`, `read`, `:`,
-`break`, `continue`, `unset`, `shift`, `set --`, and the compound commands `if/elif/else/fi`,
-`while/do/done`, `until/do/done`, `for/in/do/done`.
+`break`, `continue`, `unset`, `shift`, `set --`, `set -e`/`set +e`, and the
+compound commands `if/elif/else/fi`, `while/do/done`, `until/do/done`,
+`for/in/do/done`.
 
 Out of scope, and deliberately so: everything in Non-goals below.
 
@@ -64,11 +65,11 @@ Ranked, strongest first:
   ownership handoff. `&` is a syntax error.
 - Shell functions (`name() { ... }`).
 - Here-strings (`<<<`). psh refuses them loudly. dash has none either.
-- `trap`, and the `set` options `set -e`/`set -u`/`set -x`. The options are
-  refused with a diagnostic rather than accepted and ignored, because a
-  `set -e` that silently does nothing runs the script past the failure it
-  asked to stop at. Bare `set`, which lists every variable in dash, is
-  refused for the same reason. `set --` itself is implemented.
+- `trap`, and the `set` options `-u`, `-x` and `-o`. Those are refused with a
+  diagnostic rather than accepted and ignored, because an option that silently
+  does nothing is worse than an absent one. Bare `set`, which lists every
+  variable in dash, is refused for the same reason. `set --`, `set a b`,
+  `set -e` and `set +e` are implemented.
 - Arithmetic expansion `$(( ))`. psh refuses it loudly instead of silently
   mis-evaluating it.
 - `case`/`esac`.
@@ -204,12 +205,56 @@ Ranked, strongest first:
       back into the outer one went through eput(), which normalises the flag
       byte to 0 or 1 and so erased the field marks. Case 243 is that, and the
       27th mutation is the old loop put back.
-- [ ] `set -e` semantics, exactly: which commands are exempt (conditions of
+- [x] `set -e` semantics, exactly: which commands are exempt (conditions of
       `if`/`while`/`until`, operands of `&&`/`||`, the body of `!`), and how it
       propagates into subshells.
       why: `set -e` is notorious precisely because the exemption list is long
       and unobvious; implementing it against dash is the only way to get it
       right, and getting it wrong is worse than not having it.
+      done: 36 cases, 243 -> 279, and 288 verdicts. One flag for the option and
+      one counter for "something else is already testing this status" is the
+      whole of it: the counter rises around the condition of if/elif/while/
+      until, around every operand of && and || except the last, and around the
+      operand of `!`; the check fires only where a status is PRODUCED rather
+      than passed along, which is a simple command, a pipeline, a subshell and
+      a function call. That last distinction came from dash rather than from
+      me: `{ false && true; }` does not exit and `(false && true)` does,
+      because a brace group hands back the status of the list inside it while a
+      subshell is a command of its own. The same measurement settled three
+      more I would have got wrong. `! true` leaves status 1 and does not exit,
+      because POSIX exempts the whole pipeline beginning with `!` and not only
+      its operand. `false && true` does not exit either, since the only operand
+      whose status would be checked never ran. And the exemption is INHERITED
+      by a function body and a subshell, so `f() { false; echo in; }` prints
+      nothing as `f` and prints `in` as `if f`, which means one function has
+      two behaviours depending on the caller.
+      A command substitution is where dash and bash part company, three ways:
+      dash kills the substitution's failing command wherever the substitution
+      sits, plain bash never applies `-e` inside `$(...)` at all, and
+      `bash --posix` applies it but carries the enclosing exemption in, so
+      `if [ -n "$(false; echo in)" ]` prints `in` there and takes the else
+      branch under dash. psh follows dash, which is one line in exec_string:
+      the fork keeps the option and resets the counter. The README has both
+      divergences, including the second one, a failed redirection being status
+      2 in dash and 1 in bash.
+      The exemption list is counted rather than asserted: each of the eight
+      entries needs at least one AGREEING case or the suite exits nonzero,
+      and renaming the two elif cases out of the way produced "288 agree, 0
+      disagree" beside a red run, which is the only thing that shows the count
+      is load-bearing.
+      22 mutations, 20 caught, 2 survivors, both recorded rather than
+      explained away. Dropping the `fflush` before the errexit `exit` changes
+      nothing, because `exit` flushes stdio itself; it stays for consistency
+      with the other exit paths. Applying the options in one pass instead of
+      validating them first survives because `set -e -u` cannot be compared:
+      dash accepts `-u` and psh refuses it, so no case can see whether the
+      `-e` was applied before the refusal.
+      The first mutant also found a defect in a case rather than in psh:
+      `262-errexit-while-body.sh` was `while true; do ...; false; done`, which
+      loops forever once errexit is disabled, so the sweep hung on its first
+      mutation instead of reporting a kill. The loop counts to three now. A
+      case that cannot terminate when the feature it tests is broken is not a
+      test, it is a hang.
 - [ ] `trap`, at least `EXIT`, `INT` and `TERM`, with correct ordering against
       the exit status.
       why: cleanup handlers are how scripts avoid leaving temp files behind,

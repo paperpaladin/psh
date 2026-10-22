@@ -21,6 +21,14 @@ agree=0
 disagree=0
 skipped=0
 
+# `set -e`'s exemption list is the substance of the feature, and an entry with
+# no case behind it is an untested entry. So each exemption is counted from the
+# names of the cases that AGREED, and a zero is a failure rather than a
+# footnote. Counting files in the directory would not do: it would stay green
+# with the case present and the comparison not reached.
+EXEMPTIONS='ifcond elifcond whilecond untilcond andlist orlist bang pipestage'
+for t in $EXEMPTIONS; do eval "n_$t=0"; done
+
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT INT TERM
 work=$tmp/w
@@ -62,6 +70,9 @@ for f in "$here"/cases/*.sh; do
 
 	if [ "$ds" -eq "$ps" ] && cmp -s "$out/d.out" "$out/p.out"; then
 		agree=$((agree + 1))
+		for t in $EXEMPTIONS; do
+			case $name in *-exempt-"$t"*) eval "n_$t=\$((n_$t + 1))";; esac
+		done
 		[ -n "${V:-}" ] && echo "ok       $name"
 	else
 		disagree=$((disagree + 1))
@@ -88,8 +99,8 @@ done
 EXPANSION_REFUSALS=0
 for form in 'n=xxx; echo "${n#x}"' 'n=xxx; echo "${n%x}"' \
             'echo "${n:=d}"' 'echo "${n:?w}"' \
-            'set -e; false; echo reached' 'set -u; echo "$nope"' \
-            'set' 'set +x'; do
+            'set -u; echo "$nope"' 'set' 'set +x' \
+            'set -o errexit' 'set -eu'; do
 	EXPANSION_REFUSALS=$((EXPANSION_REFUSALS + 1))
 	echo "$form" > "$out/exp.sh"
 	( cd "$work" && "$psh" "$out/exp.sh" ) >"$out/e.out" 2>"$out/e.err"
@@ -118,7 +129,7 @@ echo "$agree agree, $disagree disagree, $skipped skipped"
 # pinned rather than floored for the same reason as wasmi's: a floor only
 # catches an empty directory, and this number is the "208 agree" that INDEX.md
 # quotes. When a case is added deliberately, this moves in the same commit.
-CASES_EXPECTED=243
+CASES_EXPECTED=279
 MAX_SKIPPED=10
 
 cases=$(ls "$here"/cases/*.sh 2>/dev/null | wc -l)
@@ -140,6 +151,18 @@ if [ "$skipped" -gt "$MAX_SKIPPED" ]; then
 	echo "  Check that \$DASH ($dash) is a working dash." >&2
 	exit 1
 fi
+
+line=
+for t in $EXEMPTIONS; do
+	eval "c=\$n_$t"
+	line="$line $t $c,"
+	if [ "$c" -eq 0 ]; then
+		echo "run.sh: no agreeing case exercises the $t exemption" >&2
+		echo "  An exemption with no case is an untested entry in the list." >&2
+		exit 1
+	fi
+done
+echo "set -e exemptions, agreeing cases each:${line%,}"
 
 # The .args sidecar cannot be checked by agreement: if the loop above never
 # read it, both shells would see zero arguments and agree with each other all

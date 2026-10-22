@@ -9,15 +9,17 @@ A POSIX shell subset in one C file, kept honest by differential testing against
 $ make test
 gcc -std=c11 -Wall -Wextra -O2 -o psh psh.c
 ./t/run.sh
-251 agree, 0 disagree, 0 skipped
+288 agree, 0 disagree, 0 skipped
+set -e exemptions, agreeing cases each: ifcond 2, elifcond 2, whilecond 2, untilcond 2, andlist 2, orlist 2, bang 2, pipestage 2
 ```
 
 ```
 $ make test-asan
 gcc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
 	-fno-omit-frame-pointer -o psh-asan psh.c
-ASAN_OPTIONS=detect_leaks=0 PSH=./psh-asan ./t/run.sh
-251 agree, 0 disagree, 0 skipped
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 PSH=./psh-asan ./t/run.sh
+288 agree, 0 disagree, 0 skipped
+set -e exemptions, agreeing cases each: ifcond 2, elifcond 2, whilecond 2, untilcond 2, andlist 2, orlist 2, bang 2, pipestage 2
 ```
 
 Run a script or a string:
@@ -44,12 +46,18 @@ So psh is organised around that question. There is no spec-reading step and no
 `t/cases/` compares psh's output against dash's, and every corner that psh
 skips is skipped on purpose, named below, and not quietly papered over.
 
-The interesting artefact is therefore not the shell. It is the 243-script
-corpus, plus eight checks that psh refuses the expansions and the `set`
+The interesting artefact is therefore not the shell. It is the 279-script
+corpus, plus nine checks that psh refuses the expansions and the `set`
 options it has not implemented, and the fact that the number on the last line
 of `make test` is a real measurement, not a self-assessment. The corpus size
 is pinned, because a run over an empty corpus and a run over all of it both
 used to print `0 disagree` and exit 0.
+
+The `set -e` exemptions are counted the same way. Each of the eight entries in
+the list has to have at least one corpus case behind it that agreed with dash,
+and the harness prints the per-entry counts and exits nonzero if any of them is
+zero: an exemption with no case is an untested entry, and the list is the whole
+of what makes `set -e` hard.
 
 ## The oracle
 
@@ -88,6 +96,62 @@ differ from the one the loop produced. The first version of this check read
 the sidecar itself and compared two fresh dash runs; it proved the file was
 not empty and nothing else, and deleting the sidecar read from the loop left
 it green.
+
+### What the sanitizers can and cannot see
+
+`make test-asan` is the second oracle, and what it cannot see was measured
+rather than reasoned about. Four reads were planted in `exec_simple`, one at a
+time, in a copy of `psh.c` outside the repository, each compiled with
+`-fsanitize=address,undefined` and run on `psh -c 'echo hi'`:
+
+    past a four-element stack array      stack-buffer-overflow, exit 1
+    one past an exactly sized strdup     heap-buffer-overflow, exit 1
+    past the live entries of FdSave's
+      int fd[16], the array half empty   nothing at all, exit 0
+    one past that array, still inside
+      the same struct                    UBSan prints "index 16 out of
+                                         bounds", exit stays 0
+
+The first two are controls, and they are what makes the other two mean
+anything: without them, "nothing was reported" cannot be told apart from "the
+compiler deleted the read". Both controls fire, so the instrument works and the
+planted reads are real.
+
+The third is the blind case. `FdSave` holds `int fd[16]` and `int saved[16]` in
+one struct, so a read inside `fd` past the entries actually saved never leaves
+the object, and no sanitizer can see it. The fourth was a surprise: UBSan knows
+the declared size of the array from its type and does report the read, but by
+default it prints a line to stderr and carries on with exit 0 -- and this
+harness compares stdout and exit status only. The diagnostic was there and the
+suite was green. `make test-asan` now sets `UBSAN_OPTIONS=halt_on_error=1`,
+which turns that class into a nonzero exit the comparison already looks at.
+
+### Where dash and bash disagree
+
+Only dash is in the harness, so these are hand measurements rather than corpus
+cases, taken against dash 0.5.12-12 on Debian 13, bash 5.2.37, and that same
+bash started with `--posix`. Two shells, three opinions. psh follows dash in both, because
+dash is the authority here; the point of writing them down is that neither is a
+bug, and a script that relies on either is not portable.
+
+`set -e` inside a command substitution. dash applies it: in
+`if [ -n "$(false; echo in)" ]` the substitution stops at `false`, comes back
+empty, and the `if` takes its else branch. Plain bash never applies `set -e`
+inside `$(...)` at all, so the same line prints `in` and takes the then branch.
+`bash --posix` applies it, but carries the enclosing exemption in with it, so
+it stops the substitution when the containing command is checked
+(`x=$(false; echo in)` gives an empty `x` and exits) and does not when the
+containing command is being tested (the `if` above prints `in`). So the
+disagreement is three-way and dash is the only one of the three that kills the
+substitution regardless of where it sits. `set +e` inside the substitution
+gets the other behaviour in all three.
+
+The status of a failed redirection. `set -e; cat < no-such-file` exits 2 under
+dash and 1 under bash in both modes, and `cd` to a missing directory is the
+same 2-versus-1. psh already answered 2 for both before `set -e` existed here,
+since dash is the oracle; what `set -e` adds is that the number becomes the
+script's exit status, so the divergence is now visible in a place scripts
+notice.
 
 ### Things dash does that were genuinely surprising
 
@@ -131,6 +195,22 @@ a numbered case in the corpus:
   so `f "$@"` passes zero arguments where `f ""` passes one. Only those
   quotes: `f ""$@` still passes one empty argument.
 - `$10` is `$1` followed by a literal `0`. The tenth parameter is `${10}`.
+- `set -e; ! true` does not exit. POSIX exempts the whole pipeline beginning
+  with `!`, not only its operand, so the script carries on with `$?` of 1.
+- `set -e; false && true` does not exit either, with status 1 at the end of
+  it. The last operand is the only one whose status is checked and the
+  short circuit means it never ran, so there is nothing to check.
+- `{ false && true; }` does not exit and `(false && true)` does. A brace group
+  hands back the status of the list inside it and is not a command that `set
+  -e` checks; a subshell is one. Same list, same status, different answer.
+- The exemption is inherited by a function body, so one function behaves two
+  ways. With `set -e` and `f() { false; echo in; }`, plain `f` prints nothing
+  and `if f; then` prints `in`. bash does the same and documents it.
+- `local x=$(false)` masks the failure in dash and in bash: the command is
+  `local`, whose own status is 0, so the substitution's 1 is discarded and
+  `set -e` sees nothing. `local x; x=$(false)` exits. psh has no `local`,
+  POSIX has none either, so the shape cannot arise here, but the plain
+  `x=$(false)` half of it does and is case 270.
 
 ## Works
 
@@ -150,7 +230,8 @@ individual bytes. Command substitution `$(...)`, nested, with trailing newlines
 stripped and its exit status visible to an assignment. Tilde expansion for a
 leading `~` or `~/`. `if`/`elif`/`else`/`fi`, `while`, `until`, `for ... in`,
 `break [n]`, `continue [n]`. Builtins `cd` (including `cd -`), `exit`, `export`,
-`echo`, `true`, `false`, `pwd`, `read`, `unset`, `:`, `set --`, `shift`.
+`echo`, `true`, `false`, `pwd`, `read`, `unset`, `:`, `set --`, `set -e`,
+`shift`.
 
 Positional parameters. `$0` is the script path as it was given on the command
 line, or the shell's own `argv[0]` under `-c`; `$1`..`$9` and `${10}` upwards
@@ -184,6 +265,42 @@ checked and not just asserted: `208-function-recursion-500-deep.sh` recurses
 500 deep and must complete, so a cap below 500 fails the suite. That case alone could not tell, it trips any cap, and
 `MAXFUNCDEPTH=50` passed all 207 of the old corpus.
 
+`set -e` and `set +e`. A failing command ends the script with that command's
+status: 3 for `(exit 3)`, 127 for a command that was not found, 137 for a child
+killed by SIGKILL. The exemption list is the part worth writing out, because it
+is the whole of what makes the option hard. Exempt, since something else is
+already testing the status:
+
+- the condition of `if` and of each `elif`, the whole compound list and not
+  only the command that decides it, so `if false; true; then` is fine;
+- the condition of `while` and of `until`;
+- every operand of `&&` and `||` except the last, which is what makes
+  `cmd || handler` the portable way to handle a failure;
+- the operand of `!`, and the result of the `!` along with it.
+
+A pipeline is not on that list and does not need to be: its status is its last
+command's, so `false | true` is a successful command and only the last stage
+can end the script. The stages are separate processes that inherit the
+exemption, so `{ false; echo in; } | cat` prints nothing on its own and prints
+`in` when it is the condition of an `if`.
+
+A function body and a subshell inherit the exemption too, all the way down:
+with `g` running `false` and `f` calling `g`, `if f; then` runs every command
+in both bodies. A command substitution does not inherit it, which is the one
+place dash and bash part company.
+
+psh checks the status where one is produced rather than where it is passed
+along: a simple command, a pipeline, a subshell, and a function call. A brace
+group, an `if`, a `while` and a `for` only hand back the status of the list
+inside them, which has already been checked or exempted, and that is the whole
+reason `{ false && true; }` does not end the script while `(false && true)`
+does.
+
+`set -e` with no operands leaves the positional parameters alone, while
+`set -e a b` and `set -e -- a b` replace them. An assignment-only command takes
+its status from the command substitution in it, so `x=$(false)` is a failing
+command and `v=$(false) true` and `echo $(false)` are not.
+
 Here-documents: `<<WORD`, `<<-WORD` with leading tabs stripped from both the
 body and the delimiter line, and the quoted forms `<<'W'`, `<<"W"` and `<<\W`
 that suppress expansion of the body entirely. An unquoted delimiter means the
@@ -216,11 +333,20 @@ Honest list. None of these are "coming soon". They are absent today.
   delimiter nothing expands and a backquote really is a literal, so there it is
   left alone.
 - No `trap`.
-- No `set` options. `set -e`, `set -u`, `set -x` and bare `set` (which lists
-  every variable in dash) are refused with a diagnostic and status 2, not
-  accepted and ignored: a `set -e` that silently does nothing keeps the
-  script running past the failure it was asked to stop at. `set --` and
-  `set a b` are implemented. Four checks in the harness assert the refusal.
+- `set -u`, `set -x`, `set -o` and bare `set` (which lists every variable in
+  dash) are refused with a diagnostic and status 2, not accepted and ignored.
+  `set -e`, `set +e`, `set --`, `set a b` and combinations of those are
+  implemented. `set -eu` in one word is refused, since it is not `-e`, and so
+  is `set -o errexit`. An unsupported option is refused before anything in the
+  same `set` is applied, so `set -e -u` leaves errexit off rather than
+  half-obeying a line dash obeys completely. Five checks in the harness assert
+  the refusals.
+
+  With `set -e` on, a refused option is itself a failing command, so the script
+  stops at the refusal with status 2 rather than running on with the option
+  silently absent. dash accepts `-u` and stops later at the first real failure
+  with status 1, so the corpus cannot compare this: it is psh being stricter
+  than its oracle, deliberately.
 - `${VAR#pat}` and `${VAR%pat}` are refused, and neither quietly expands to nothing. They are
   not implemented (PLAN item 201), and until recently the name scan in
   `expand_brace` stopped only at `:`, `-` and `+`, so `${n#x}` was read as a

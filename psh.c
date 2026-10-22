@@ -49,6 +49,44 @@ static int funcdepth;
 
 static int unwinding(void) { return loopctl || retctl; }
 
+/*
+ * `set -e`. errexit is the option; etested is the depth of enclosing
+ * constructs that are TESTING the status being produced, which is the whole
+ * of POSIX's exemption list expressed as one counter:
+ *
+ *   the condition of if / elif / while / until
+ *   every operand of && and || except the last
+ *   the operand of !, and the result of ! itself
+ *
+ * A pipeline is not on that list and does not need to be: its status is its
+ * last command's, so `false | true` is a successful command and nothing is
+ * exempted. The stages are separate processes that inherit the counter, so a
+ * failing stage of a pipeline in a tested position is exempt too.
+ *
+ * The counter is inherited, not reset, by a function body and by a subshell,
+ * which is what makes the awkward cases come out right: with `set -e` on,
+ * `f() { false; echo in; }` prints nothing when called as `f` and prints `in`
+ * when called as `if f`. dash does that and so does bash.
+ *
+ * Checked where a status is produced rather than passed along: a simple
+ * command, a pipeline, a subshell and a function call. A brace group, an if,
+ * a while and a for only hand back the status of the list inside them, which
+ * has already been checked or exempted, so they are transparent -- that is why
+ * `{ false && true; }` does not exit while `(false && true)` does.
+ */
+static int errexit;
+static int etested;
+
+static int eck(int st) {
+	if (errexit && !etested && st != 0) {
+		fflush(NULL); /* exit() flushes stdio itself; this is for symmetry
+		               * with the other exit paths, and a mutation sweep
+		               * records it as an equivalent mutant for that reason. */
+		exit(st);
+	}
+	return st;
+}
+
 static void fatal(const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
@@ -1723,13 +1761,17 @@ static int b_break(char **av) { return b_loopctl(av, 1); }
 static int b_continue(char **av) { return b_loopctl(av, 2); }
 
 /*
- * `set`. Only the positional-parameter half: `set -- a b c`, `set --` to
- * clear, and the operand form `set a b` that dash also accepts.
+ * `set`. The positional-parameter half -- `set -- a b c`, `set --` to clear,
+ * and the operand form `set a b` that dash also accepts -- plus `-e` and `+e`.
  *
- * Anything that looks like an option is refused with a diagnostic rather than
- * ignored. `set -e` silently doing nothing is the worst available outcome: the
- * script keeps running past the failure it asked to abort on, and nothing says
- * so. Bare `set` lists every variable in dash, which is a different feature.
+ * Any other option is still refused with a diagnostic rather than ignored,
+ * and the refusal happens before anything is applied, so `set -e -u` leaves
+ * errexit off rather than half-obeying a line dash obeys completely. `-eu` in
+ * one word is refused too: it is not `-e`. Bare `set` lists every variable in
+ * dash, which is a different feature.
+ *
+ * `set -e` on its own does not touch the positional parameters. Only `--` or
+ * an operand replaces them, so `set -- a b; set -e` leaves $# at 2.
  */
 static int b_set(char **av) {
 	char **p = av + 1;
@@ -1738,14 +1780,22 @@ static int b_set(char **av) {
 		fprintf(stderr, "%s: set: listing variables is unsupported\n", progname);
 		return 2;
 	}
-	if (!strcmp(*p, "--")) {
-		p++;
-	} else if (**p == '-' || **p == '+') {
-		fflush(stdout);
-		fprintf(stderr, "%s: set %s: unsupported option\n", progname, *p);
-		return 2;
+	for (char **q = p; *q && strcmp(*q, "--") && (**q == '-' || **q == '+'); q++) {
+		if (strcmp(*q, "-e") && strcmp(*q, "+e")) {
+			fflush(stdout);
+			fprintf(stderr, "%s: set %s: unsupported option\n", progname, *q);
+			return 2;
+		}
 	}
-	args_set(p);
+	int opts = 0;
+	while (*p && strcmp(*p, "--") && (**p == '-' || **p == '+')) {
+		errexit = (**p == '-');
+		opts++;
+		p++;
+	}
+	if (*p && !strcmp(*p, "--")) args_set(p + 1);
+	else if (*p) args_set(p);
+	else if (!opts) args_set(p);
 	return 0;
 }
 
@@ -2294,14 +2344,16 @@ static int exec_compound_body(Node *n) {
 		}
 		int st = 0;
 		while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-		return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+		return eck(WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
 	}
 	case N_GROUP:
 		/* A brace group runs in the CURRENT shell -- unlike ( ), assignments
 		 * and cd inside it are visible afterwards. */
 		return exec_node(n->body);
 	case N_IF: {
+		etested++;
 		int c = exec_node(n->cond);
+		etested--;
 		status = c;
 		if (c == 0) return exec_node(n->body);
 		if (n->els) return exec_node(n->els);
@@ -2312,7 +2364,9 @@ static int exec_compound_body(Node *n) {
 		int st = 0;
 		loopdepth++;
 		for (;;) {
+			etested++;
 			int c = exec_node(n->cond);
+			etested--;
 			status = c;
 			if (unwinding()) break;
 			if (invert ? (c == 0) : (c != 0)) break;
@@ -2353,25 +2407,38 @@ static int exec_node(Node *n) {
 		return exec_node(n->right);
 	}
 	case N_AND: {
+		/* Every operand but the last is tested by the operator. The last one
+		 * inherits whatever position the whole list is in, and a list that
+		 * short-circuits never reaches it, which is why `false && true` does
+		 * not exit under `set -e` even though its status is 1. */
+		etested++;
 		int s = exec_node(n->left);
+		etested--;
 		status = s;
 		if (unwinding()) return s;
 		return s == 0 ? exec_node(n->right) : s;
 	}
 	case N_OR: {
+		etested++;
 		int s = exec_node(n->left);
+		etested--;
 		status = s;
 		if (unwinding()) return s;
 		return s != 0 ? exec_node(n->right) : s;
 	}
 	case N_NOT: {
+		/* The operand is tested, and the `!` is not checked afterwards
+		 * either: POSIX exempts the whole pipeline, so `set -e; ! true`
+		 * carries on with status 1. */
+		etested++;
 		int s = exec_node(n->body);
+		etested--;
 		return status = (s == 0) ? 1 : 0;
 	}
 	case N_PIPE:
-		return status = exec_pipeline(n);
+		return status = eck(exec_pipeline(n));
 	case N_SIMPLE:
-		return status = exec_simple(n, 0);
+		return status = eck(exec_simple(n, 0));
 	case N_FUNCDEF:
 		/* Defining a function is successful and runs nothing. */
 		return status = func_define(n->var, n->body);
@@ -2403,6 +2470,16 @@ static int exec_string(const char *s) {
 	int oloopctl = loopctl, oloopcnt = loopcnt, oloopdepth = loopdepth;
 	loopctl = loopcnt = loopdepth = 0;
 
+	/* `set -e` crosses into a command substitution -- it is the same process
+	 * image after the fork -- but the exemption does NOT: dash kills the
+	 * substitution's own failing command even when the command containing it
+	 * is being tested, so `set -e; if [ -n "$(false; echo in)" ]` sees an
+	 * empty string. bash in posix mode carries the exemption in and prints
+	 * `in`; plain bash never applies -e inside a substitution at all. dash is
+	 * the oracle here. */
+	int oetested = etested;
+	etested = 0;
+
 	int rc;
 	if (lex(s) < 0) {
 		rc = 2;
@@ -2418,6 +2495,7 @@ static int exec_string(const char *s) {
 	loopctl = oloopctl;
 	loopcnt = oloopcnt;
 	loopdepth = oloopdepth;
+	etested = oetested;
 	return rc;
 }
 
